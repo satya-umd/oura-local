@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Laura — Oura Ring 3 Household & Personal Analytics</title>
+  <meta name="description" content="Self-hosted Oura Ring Gen 3 multi-user dashboard, couple recovery sync, and long-term biometric analytics." />
+  <meta name="theme-color" content="#090d16" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Laura" />
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+  <link rel="apple-touch-icon" href="./icon.svg" />
+  <link rel="stylesheet" href="./styles.css?v=6" />
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    if ('caches' in window) {
+      caches.keys().then((keys) => {
+        keys.forEach((k) => {
+          if (k !== 'laura-pwa-v6') caches.delete(k);
+        });
+      });
+    }
+  </script>
+  <script type="module" src="./app.js?v=6"></script>
+</body>
+</html>

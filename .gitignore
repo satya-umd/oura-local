@@ -1,0 +1,14 @@
+# Local SQLite database and master encryption key (never commit)
+data/
+*.db
+*.db-shm
+*.db-wal
+.secret_key
+
+# Reference cloned repos
+open_oura/
+open_health/
+
+# OS & editor files
+.DS_Store
+node_modules/

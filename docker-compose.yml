@@ -1,0 +1,38 @@
+services:
+  laura:
+    build: .
+    container_name: laura-oura-hub
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATA_DIR=/app/data
+      - LAURA_SECRET_KEY=${LAURA_SECRET_KEY:-}
+      - OURA_CLIENT_ID=${OURA_CLIENT_ID:-}
+      - OURA_CLIENT_SECRET=${OURA_CLIENT_SECRET:-}
+      - OURA_REDIRECT_URI=${OURA_REDIRECT_URI:-}
+      - SYNC_INTERVAL_HOURS=${SYNC_INTERVAL_HOURS:-2}
+    volumes:
+      - laura_data:/app/data
+
+  # Optional: Uncomment caddy below for automatic HTTPS via Let's Encrypt or Tailscale certs
+  # caddy:
+  #   image: caddy:2-alpine
+  #   container_name: laura-caddy
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   depends_on:
+  #     - laura
+
+volumes:
+  laura_data:
+  # caddy_data:
+  # caddy_config:

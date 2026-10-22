@@ -1,0 +1,14 @@
+{
+  "name": "laura-oura-hub",
+  "version": "1.0.0",
+  "description": "Self-hosted Oura Ring Gen 3 multi-user & couple analytics PWA with built-in Oura Cloud API v2 sync, SQLite storage, and AES-256 token encryption.",
+  "type": "module",
+  "scripts": {
+    "start": "./scripts/run-node.sh src/server.mjs",
+    "seed": "./scripts/run-node.sh src/seed.mjs",
+    "test": "./scripts/run-node.sh src/test.mjs"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
