@@ -35,6 +35,9 @@ import {
   deleteSession,
   deleteSessionByPrefix,
   getLatestDayForUser,
+  getSyncedDaysForUser,
+  clearUserSummariesForRealSync,
+  toLocalDayStr,
   getDailySummary,
   getDailySummariesRange,
   upsertDailySummary,
@@ -161,9 +164,9 @@ function canAccessUser(currentUser, targetUserId) {
 }
 
 function subtractDaysStr(dayStr, days) {
-  const d = new Date(`${dayStr}T12:00:00Z`);
-  d.setUTCDate(d.getUTCDate() - days);
-  return d.toISOString().slice(0, 10);
+  const [y, m, d] = String(dayStr).split('-').map(Number);
+  const dt = new Date(y, (m || 1) - 1, (d || 1) - days, 12, 0, 0);
+  return toLocalDayStr(dt);
 }
 
 const MIME_TYPES = {
@@ -483,7 +486,8 @@ export const server = http.createServer(async (req, res) => {
       const result = ingestBleNotifications(currentUser.id, {
         serial,
         notificationsHex,
-        phoneUnix
+        phoneUnix,
+        clearDemo: true
       });
 
       addSyncLog(currentUser.id, {
@@ -498,6 +502,21 @@ export const server = http.createServer(async (req, res) => {
         ok: true,
         ...result,
         user: getUserById(currentUser.id)
+      });
+    }
+
+    // Clear pre-seeded demo summaries and keep only real synced ring events
+    if (pathname === '/api/ring/clear-demo' && method === 'POST') {
+      clearUserSummariesForRealSync(currentUser.id);
+      const agg = aggregateRingEventsToSummaries(currentUser.id);
+      return sendJson(res, 200, {
+        ok: true,
+        daysSynced: agg.daysUpdated,
+        eventsProcessed: agg.eventsProcessed,
+        message:
+          agg.daysUpdated > 0
+            ? `Cleared demo data. Kept ${agg.daysUpdated} real synced ring day(s).`
+            : 'Cleared all demo data. Unsynced days now show 0 / No Data until your ring syncs.'
       });
     }
 
@@ -634,7 +653,8 @@ export const server = http.createServer(async (req, res) => {
         return sendJson(res, 403, { error: 'This household member has private ring data.' });
       }
 
-      const latestDay = getLatestDayForUser(targetUserId);
+      const syncedDays = getSyncedDaysForUser(targetUserId);
+      const latestDay = syncedDays[syncedDays.length - 1] || toLocalDayStr();
       const day = url.searchParams.get('day') || latestDay;
       const summary = getDailySummary(targetUserId, day);
       const baseline = getUserBaselines(targetUserId, day, 30);
@@ -647,6 +667,7 @@ export const server = http.createServer(async (req, res) => {
         user: targetUser,
         day,
         latestDay,
+        syncedDays,
         summary,
         baseline,
         heartrate,
@@ -658,7 +679,7 @@ export const server = http.createServer(async (req, res) => {
     // Save custom daily note & tags
     if (pathname === '/api/dashboard/note' && method === 'POST') {
       const body = await readJsonBody(req);
-      const day = String(body.day || new Date().toISOString().slice(0, 10));
+      const day = String(body.day || toLocalDayStr());
       const customNote = String(body.customNote || '');
       const tags = Array.isArray(body.tags)
         ? body.tags.map((t) => String(t).trim()).filter(Boolean)

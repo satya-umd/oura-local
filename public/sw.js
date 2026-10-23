@@ -1,5 +1,5 @@
-const CACHE_NAME = 'laura-pwa-v6';
-const STATIC_ASSETS = ['./', './index.html', './styles.css?v=6', './app.js?v=6', './static-backend.js?v=6', './manifest.json', './icon.svg'];
+const CACHE_NAME = 'laura-pwa-v7';
+const STATIC_ASSETS = ['./', './index.html', './styles.css?v=7', './app.js?v=7', './static-backend.js?v=7', './manifest.json', './icon.svg'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

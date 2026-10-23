@@ -2,13 +2,14 @@ import {
   listHouseholdUsers,
   getDailySummary,
   getDailySummariesRange,
-  getUserBaselines
+  getUserBaselines,
+  toLocalDayStr
 } from './db.mjs';
 
 function subtractDays(dayStr, numDays) {
-  const d = new Date(`${dayStr}T12:00:00Z`);
-  d.setUTCDate(d.getUTCDate() - numDays);
-  return d.toISOString().slice(0, 10);
+  const [y, m, d] = String(dayStr).split('-').map(Number);
+  const dt = new Date(y, (m || 1) - 1, (d || 1) - numDays, 12, 0, 0);
+  return toLocalDayStr(dt);
 }
 
 function parseBedtimeHour(isoStr) {

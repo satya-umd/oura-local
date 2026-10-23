@@ -683,9 +683,30 @@ export function formatDailySummary(row) {
   };
 }
 
+export function toLocalDayStr(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 export function getLatestDayForUser(userId) {
   const row = db.prepare('SELECT MAX(day) as latest_day FROM daily_summaries WHERE user_id = ?').get(userId);
-  return row?.latest_day || new Date().toISOString().slice(0, 10);
+  return row?.latest_day || toLocalDayStr();
+}
+
+export function getSyncedDaysForUser(userId) {
+  return db
+    .prepare('SELECT day FROM daily_summaries WHERE user_id = ? ORDER BY day ASC')
+    .all(userId)
+    .map((r) => r.day);
+}
+
+export function clearUserSummariesForRealSync(userId) {
+  db.prepare('DELETE FROM daily_summaries WHERE user_id = ?').run(userId);
+  db.prepare('DELETE FROM heartrate_samples WHERE user_id = ?').run(userId);
+  db.prepare('DELETE FROM workouts WHERE user_id = ?').run(userId);
 }
 
 export function getDailySummary(userId, day) {

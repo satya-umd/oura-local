@@ -204,6 +204,481 @@ function sanitizeUser(u) {
   };
 }
 
+export function toLocalDayStr(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function localDayDate(dayStr, hours = 0, minutes = 0, seconds = 0) {
+  const [y, m, d] = String(dayStr).split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1, hours, minutes, seconds, 0);
+}
+
+function buildSyncTimeHexBrowser() {
+  const unixSecs = BigInt(Math.floor(Date.now() / 1000));
+  const tzHalfHours = Math.round(-new Date().getTimezoneOffset() / 30) & 0xff;
+  const bytes = new Uint8Array(11);
+  bytes[0] = 0x12;
+  bytes[1] = 0x09;
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(2, unixSecs, true);
+  bytes[10] = tzHalfHours;
+  return bytesToHex(bytes);
+}
+
+// --- Browser-Side Th0rgal/open_oura Binary Packet Decoder & Scorer ---
+const EVENT_NAMES_BROWSER = {
+  0x41: 'ring_start',
+  0x42: 'time_sync',
+  0x43: 'debug_event',
+  0x45: 'state_change',
+  0x46: 'temp_event',
+  0x47: 'motion_event',
+  0x4b: 'sleep_phase_information',
+  0x4e: 'sleep_phase_details',
+  0x50: 'activity_information',
+  0x53: 'wear_event',
+  0x5a: 'sleep_phase_data',
+  0x5d: 'hrv_event',
+  0x60: 'ibi_and_amplitude_event',
+  0x69: 'temp_period',
+  0x6a: 'sleep_period_information_2',
+  0x6f: 'spo2_event',
+  0x75: 'sleep_temp_event',
+  0x76: 'bedtime_period',
+  0x80: 'green_ibi_quality_event',
+  0x85: 'rtc_beacon',
+  0x8b: 'spo2_r_pi_event'
+};
+
+function parsePacketsBrowser(bytes) {
+  const out = [];
+  let i = 0;
+  while (i + 2 <= bytes.length) {
+    const tag = bytes[i];
+    const len = bytes[i + 1];
+    const start = i + 2;
+    const end = start + len;
+    if (end > bytes.length) break;
+    out.push({ tag, payload: bytes.subarray(start, end) });
+    i = end;
+  }
+  if (out.length === 0 && bytes.length >= 2) {
+    out.push({ tag: bytes[0], payload: bytes.subarray(2) });
+  }
+  return out;
+}
+
+function readU32LE(b, off = 0) {
+  return ((b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)) >>> 0);
+}
+
+function readI16LE(b, off = 0) {
+  const v = b[off] | (b[off + 1] << 8);
+  return v & 0x8000 ? v - 0x10000 : v;
+}
+
+function decodeEventBodyBrowser(tag, body) {
+  switch (tag) {
+    case 0x46:
+    case 0x69:
+    case 0x75: {
+      if (body.length < 2) return null;
+      const temps_c = [];
+      for (let i = 0; i + 1 < body.length; i += 2) {
+        const c = readI16LE(body, i) / 100.0;
+        if (c >= 30.0 && c <= 41.0) temps_c.push(c);
+      }
+      return temps_c.length ? { temps_c } : null;
+    }
+    case 0x4b:
+    case 0x4e:
+    case 0x5a: {
+      if (body.length < 2) return null;
+      const PHASE = ['1', '2', '3', '4']; // 1=deep, 2=light, 3=rem, 4=awake
+      const stages = [];
+      for (let i = 1; i < body.length; i++) {
+        const b = body[i];
+        for (const shift of [6, 4, 2, 0]) {
+          stages.push(PHASE[(b >> shift) & 0x03]);
+        }
+      }
+      return { stages };
+    }
+    case 0x50: {
+      if (body.length < 2) return null;
+      const met = [];
+      for (let i = 1; i < body.length; i++) {
+        const b = body[i];
+        met.push(b < 0x80 ? b * 0.1 : 12.8 + (b - 128) * 0.2);
+      }
+      return { met };
+    }
+    case 0x5d: {
+      if (body.length < 2) return null;
+      const hr_bpm = [];
+      const rmssd_ms = [];
+      for (let i = 0; i + 1 < body.length; i += 2) {
+        if (body[i] >= 35 && body[i] <= 140) hr_bpm.push(body[i]);
+        if (body[i + 1] >= 10 && body[i + 1] <= 250) rmssd_ms.push(body[i + 1]);
+      }
+      return { hr_bpm, rmssd_ms };
+    }
+    case 0x60: {
+      if (body.length !== 14) return null;
+      const b = body;
+      const ibi_ms = [
+        (b[6] & 1) | (b[0] << 3) | ((b[12] >> 5) & 6),
+        (b[7] & 1) | (b[1] << 3) | ((b[12] >> 3) & 6),
+        (b[8] & 1) | (b[2] << 3) | ((b[12] >> 1) & 6),
+        (b[9] & 1) | (b[3] << 3) | ((b[12] & 3) << 1),
+        (b[10] & 1) | (b[4] << 3) | ((b[13] >> 5) & 6),
+        (b[11] & 1) | (b[5] << 3) | ((b[13] >> 3) & 6)
+      ];
+      const hr_bpm = ibi_ms.filter((i) => i >= 300 && i <= 2000).map((i) => Math.floor(60000 / i));
+      return { hr_bpm };
+    }
+    case 0x6a: {
+      if (body.length < 10) return null;
+      return {
+        average_hr: body[0] * 0.5,
+        breath: body[4] / 8.0,
+        sleep_state: body[7]
+      };
+    }
+    case 0x6f: {
+      if (body.length < 2) return null;
+      let end = body.length;
+      if (body[end - 1] === 0xff) end -= 1;
+      const spo2 = [];
+      for (let i = 1; i < end; i++) {
+        if (body[i] >= 80 && body[i] <= 100) spo2.push(body[i]);
+      }
+      return spo2.length ? { spo2 } : null;
+    }
+    case 0x76: {
+      if (body.length < 8) return null;
+      return {
+        bedtime_start_ds: readU32LE(body, 0),
+        bedtime_end_ds: readU32LE(body, 4)
+      };
+    }
+    case 0x80: {
+      if (body.length < 2) return null;
+      const hr_bpm = [];
+      for (let i = 0; i + 1 < body.length; i += 2) {
+        const ibi = (body[i + 1] & 0x07) | (body[i] << 3);
+        const q = (body[i + 1] >> 3) & 0x03;
+        if (q === 1 && ibi >= 300 && ibi <= 2000) hr_bpm.push(Math.floor(60000 / ibi));
+      }
+      return { hr_bpm };
+    }
+    default:
+      return null;
+  }
+}
+
+function ingestBleNotificationsBrowser(db, user, { serial, notificationsHex = [], phoneUnix = Math.floor(Date.now() / 1000), clearDemo = true }) {
+  if (clearDemo) {
+    const existingDays = db.summaries[user.id] || {};
+    for (const k of Object.keys(existingDays)) {
+      if (existingDays[k]?.isDemo || existingDays[k]?.sleep?.hypnogram5min === '422111223322112233322123324') {
+        delete existingDays[k];
+        if (db.heartrates[user.id]) delete db.heartrates[user.id][k];
+      }
+    }
+  }
+  user.hasSyncedRealRing = true;
+
+  let maxRingTs = 0;
+  let eventsIngested = 0;
+  const rawEvents = [];
+  const countsMap = new Map();
+
+  for (const hexStr of notificationsHex) {
+    const clean = String(hexStr || '').trim().replace(/\s+/g, '').replace(/^0x/i, '');
+    if (!clean || clean.length < 4) continue;
+    const bytes = hexToBytes(clean);
+    const packets = parsePacketsBrowser(bytes);
+
+    for (const pkt of packets) {
+      if (pkt.tag === 0x0b && pkt.payload.length >= 3) {
+        user.ringFirmware = `${pkt.payload[0]}.${pkt.payload[1]}.${pkt.payload[2]}`;
+      } else if (pkt.tag === 0x0d && pkt.payload.length >= 1) {
+        user.ringBattery = Math.min(100, pkt.payload[0]);
+      } else if (pkt.tag === 0x11 && pkt.payload.length > 1 && pkt.payload[0] !== 0x09) {
+        const txt = Array.from(pkt.payload)
+          .filter((c) => c >= 32 && c <= 126)
+          .map((c) => String.fromCharCode(c))
+          .join('')
+          .trim();
+        if (txt) user.ringSerial = txt;
+      } else if (pkt.tag === 0x13 && pkt.payload.length >= 4) {
+        const ts = readU32LE(pkt.payload, 0);
+        if (ts > maxRingTs) maxRingTs = ts;
+      } else if (pkt.tag >= 0x41 && pkt.payload.length >= 4) {
+        const rts = readU32LE(pkt.payload, 0);
+        if (rts > maxRingTs) maxRingTs = rts;
+        const body = pkt.payload.subarray(4);
+        const name = EVENT_NAMES_BROWSER[pkt.tag] || `event_0x${pkt.tag.toString(16)}`;
+        const tagHex = `0x${pkt.tag.toString(16).padStart(2, '0')}`;
+        countsMap.set(tagHex, { tagHex, name, count: (countsMap.get(tagHex)?.count || 0) + 1 });
+        rawEvents.push({
+          tag: pkt.tag,
+          name,
+          ringTimestamp: rts,
+          decoded: decodeEventBodyBrowser(pkt.tag, body)
+        });
+        eventsIngested++;
+      }
+    }
+  }
+
+  if (countsMap.size > 0) {
+    db.ringEvents[user.id] = [...countsMap.values()];
+  }
+  if (maxRingTs > 0) {
+    user.ringCursor = maxRingTs;
+  }
+
+  const bootUnix = phoneUnix - maxRingTs / 10.0;
+  const byDay = new Map();
+
+  const ensureDay = (day) => {
+    if (!byDay.has(day)) {
+      byDay.set(day, {
+        day,
+        hasData: false,
+        bedtimeStartUnix: null,
+        bedtimeEndUnix: null,
+        sleepMinUnix: null,
+        sleepMaxUnix: null,
+        deepSec: 0,
+        remSec: 0,
+        lightSec: 0,
+        awakeSec: 0,
+        hypno: [],
+        hr5min: [],
+        hrv5min: [],
+        hrSamples: [],
+        breath: [],
+        temps: [],
+        spo2: [],
+        steps: 0,
+        activeCal: 0,
+        highSec: 0,
+        medSec: 0,
+        lowSec: 0,
+        sedSec: 0
+      });
+    }
+    return byDay.get(day);
+  };
+
+  for (const ev of rawEvents) {
+    if (!ev.decoded) continue;
+    const unixSec = Math.round(bootUnix + ev.ringTimestamp / 10.0);
+    // Shift by 4 hours so sleep starting at 8:00 PM - 11:59 PM local time attributes to waking local day
+    const day = toLocalDayStr(new Date((unixSec + 4 * 3600) * 1000));
+    const d = ev.decoded;
+    const b = ensureDay(day);
+    b.hasData = true;
+
+    if (ev.tag === 0x76) {
+      const startU = Math.round(unixSec - (ev.ringTimestamp - d.bedtime_start_ds) / 10.0);
+      const endU = Math.round(unixSec - (ev.ringTimestamp - d.bedtime_end_ds) / 10.0);
+      if (endU >= startU && endU - startU <= 54000) {
+        b.bedtimeStartUnix = b.bedtimeStartUnix ? Math.min(b.bedtimeStartUnix, startU) : startU;
+        b.bedtimeEndUnix = b.bedtimeEndUnix ? Math.max(b.bedtimeEndUnix, endU) : endU;
+      }
+    } else if (ev.tag === 0x4b || ev.tag === 0x4e || ev.tag === 0x5a) {
+      b.sleepMinUnix = b.sleepMinUnix !== null ? Math.min(b.sleepMinUnix, unixSec) : unixSec;
+      b.sleepMaxUnix = b.sleepMaxUnix !== null ? Math.max(b.sleepMaxUnix, unixSec) : unixSec;
+      for (const ch of d.stages || []) {
+        b.hypno.push(ch);
+        if (ch === '1') b.deepSec += 300;
+        else if (ch === '3') b.remSec += 300;
+        else if (ch === '4') b.awakeSec += 300;
+        else b.lightSec += 300;
+      }
+    } else if (ev.tag === 0x6a) {
+      b.sleepMinUnix = b.sleepMinUnix !== null ? Math.min(b.sleepMinUnix, unixSec) : unixSec;
+      b.sleepMaxUnix = b.sleepMaxUnix !== null ? Math.max(b.sleepMaxUnix, unixSec) : unixSec;
+      if (d.average_hr >= 35 && d.average_hr <= 130) {
+        const bpm = Math.round(d.average_hr);
+        b.hr5min.push(bpm);
+        b.hrSamples.push({ timestamp: new Date(unixSec * 1000).toISOString(), bpm, source: 'sleep' });
+      }
+      if (d.breath >= 8 && d.breath <= 30) b.breath.push(d.breath);
+    } else if (ev.tag === 0x5d) {
+      b.sleepMinUnix = b.sleepMinUnix !== null ? Math.min(b.sleepMinUnix, unixSec) : unixSec;
+      b.sleepMaxUnix = b.sleepMaxUnix !== null ? Math.max(b.sleepMaxUnix, unixSec) : unixSec;
+      for (const r of d.rmssd_ms || []) b.hrv5min.push(r);
+      (d.hr_bpm || []).forEach((bpm, idx) => {
+        b.hr5min.push(bpm);
+        b.hrSamples.push({ timestamp: new Date((unixSec + idx * 300) * 1000).toISOString(), bpm, source: 'sleep' });
+      });
+    } else if (ev.tag === 0x60 || ev.tag === 0x80) {
+      const src = ev.tag === 0x80 ? 'awake' : 'sleep';
+      for (const bpm of d.hr_bpm || []) {
+        b.hrSamples.push({ timestamp: new Date(unixSec * 1000).toISOString(), bpm, source: src });
+      }
+    } else if (ev.tag === 0x46 || ev.tag === 0x69 || ev.tag === 0x75) {
+      for (const c of d.temps_c || []) b.temps.push(c);
+    } else if (ev.tag === 0x6f) {
+      for (const s of d.spo2 || []) b.spo2.push(s);
+    } else if (ev.tag === 0x50) {
+      for (const m of d.met || []) {
+        if (m > 1.3) b.steps += Math.round((m - 1.0) * 45);
+        if (m > 1.2) b.activeCal += Math.round((m - 1.0) * 1.4);
+        if (m >= 6.0) b.highSec += 60;
+        else if (m >= 3.0) b.medSec += 60;
+        else if (m >= 1.5) b.lowSec += 60;
+        else b.sedSec += 60;
+      }
+    }
+  }
+
+  if (!db.summaries[user.id]) db.summaries[user.id] = {};
+  if (!db.heartrates[user.id]) db.heartrates[user.id] = {};
+
+  let daysUpdated = 0;
+  for (const [day, b] of [...byDay.entries()].sort((a, z) => a[0].localeCompare(z[0]))) {
+    if (!b.hasData) continue;
+
+    let totalSeconds = b.deepSec + b.remSec + b.lightSec;
+    let deepSeconds = b.deepSec;
+    let remSeconds = b.remSec;
+    let lightSeconds = b.lightSec;
+    let awakeSeconds = b.awakeSec;
+
+    if (totalSeconds === 0 && b.bedtimeStartUnix && b.bedtimeEndUnix && b.bedtimeEndUnix > b.bedtimeStartUnix) {
+      const span = Math.min(43200, b.bedtimeEndUnix - b.bedtimeStartUnix);
+      awakeSeconds = Math.round(span * 0.09);
+      totalSeconds = span - awakeSeconds;
+      deepSeconds = Math.round(totalSeconds * 0.21);
+      remSeconds = Math.round(totalSeconds * 0.23);
+      lightSeconds = totalSeconds - deepSeconds - remSeconds;
+    }
+
+    const hasSleep = totalSeconds > 0 || b.hypno.length > 0;
+    const timeInBedSeconds = totalSeconds + awakeSeconds;
+    const efficiency = timeInBedSeconds > 0 ? Math.round((totalSeconds / timeInBedSeconds) * 100) : 0;
+    const lowestHr = b.hr5min.length > 0 ? Math.min(...b.hr5min) : null;
+    const averageHr = b.hr5min.length > 0 ? Number((b.hr5min.reduce((a, v) => a + v, 0) / b.hr5min.length).toFixed(1)) : null;
+    const averageHrv = b.hrv5min.length > 0 ? Math.round(b.hrv5min.reduce((a, v) => a + v, 0) / b.hrv5min.length) : null;
+    const averageBreath = b.breath.length > 0 ? Number((b.breath.reduce((a, v) => a + v, 0) / b.breath.length).toFixed(1)) : null;
+    const spo2Pct = b.spo2.length > 0 ? Number((b.spo2.reduce((a, v) => a + v, 0) / b.spo2.length).toFixed(1)) : null;
+    const tempDev = b.temps.length > 0 ? Number((b.temps.reduce((a, v) => a + v, 0) / b.temps.length - 36.25).toFixed(2)) : null;
+
+    let bedtimeStart = null;
+    let bedtimeEnd = null;
+    if (b.bedtimeStartUnix && b.bedtimeEndUnix && b.bedtimeEndUnix > b.bedtimeStartUnix) {
+      bedtimeStart = new Date(b.bedtimeStartUnix * 1000).toISOString();
+      bedtimeEnd = new Date(b.bedtimeEndUnix * 1000).toISOString();
+    } else if (hasSleep && b.sleepMinUnix && b.sleepMaxUnix) {
+      const endU = b.sleepMaxUnix;
+      const startU = Math.min(b.sleepMinUnix, endU - Math.max(timeInBedSeconds, 3600));
+      bedtimeStart = new Date(startU * 1000).toISOString();
+      bedtimeEnd = new Date(endU * 1000).toISOString();
+    } else if (hasSleep) {
+      const localWake = localDayDate(day, 6, 45, 0);
+      const localBed = new Date(localWake.getTime() - Math.max(timeInBedSeconds, 25200) * 1000);
+      bedtimeStart = localBed.toISOString();
+      bedtimeEnd = localWake.toISOString();
+    }
+
+    const sleepScore = hasSleep
+      ? Math.max(40, Math.min(98, Math.round(55 + (totalSeconds / 3600 - 6) * 10 + (efficiency - 80) * 0.6)))
+      : 0;
+    const activityScore = b.steps > 0 || b.activeCal > 0
+      ? Math.max(45, Math.min(98, Math.round(60 + (b.steps / 10000) * 25)))
+      : 0;
+    const readinessScore = hasSleep || lowestHr !== null || averageHrv !== null
+      ? Math.max(45, Math.min(98, Math.round((sleepScore || 78) * 0.45 + (averageHrv ? Math.min(98, averageHrv + 20) : 78) * 0.55)))
+      : 0;
+
+    db.summaries[user.id][day] = {
+      userId: user.id,
+      day,
+      isDemo: false,
+      readiness: {
+        score: readinessScore,
+        tempDeviation: tempDev,
+        tempTrendDeviation: tempDev,
+        contributors: {
+          hrvBalance: averageHrv != null ? Math.min(99, averageHrv + 20) : 0,
+          restingHeartRate: lowestHr != null ? Math.min(99, 138 - lowestHr) : 0,
+          recoveryIndex: hasSleep ? Math.min(99, readinessScore + 2) : 0,
+          sleepBalance: sleepScore,
+          previousNight: sleepScore,
+          activityBalance: activityScore
+        }
+      },
+      sleep: {
+        score: sleepScore,
+        totalSeconds,
+        deepSeconds,
+        remSeconds,
+        lightSeconds,
+        awakeSeconds,
+        timeInBedSeconds,
+        efficiency,
+        latencySeconds: hasSleep ? 720 : 0,
+        lowestHr,
+        averageHr,
+        averageHrv,
+        averageBreath,
+        bedtimeStart,
+        bedtimeEnd,
+        hypnogram5min: b.hypno.join(''),
+        hr5min: b.hr5min,
+        hrv5min: b.hrv5min
+      },
+      activity: {
+        score: activityScore,
+        steps: b.steps,
+        activeCalories: b.activeCal,
+        totalCalories: b.steps > 0 || b.activeCal > 0 ? 1680 + b.activeCal : 0,
+        walkingDistanceMeters: Math.round(b.steps * 0.762),
+        highSeconds: b.highSec,
+        mediumSeconds: b.medSec,
+        lowSeconds: b.lowSec,
+        sedentarySeconds: b.sedSec,
+        inactivityAlerts: 0
+      },
+      spo2: {
+        percentage: spo2Pct,
+        breathingDisturbanceIndex: spo2Pct ? 0.4 : null
+      },
+      stress: {
+        stressHighSeconds: 0,
+        recoveryHighSeconds: 0,
+        daySummary: hasSleep ? (readinessScore >= 82 ? 'restored' : 'normal') : 'no data'
+      },
+      tags: db.summaries[user.id][day]?.tags || [],
+      customNote: db.summaries[user.id][day]?.customNote || ''
+    };
+
+    if (b.hrSamples.length > 0) {
+      db.heartrates[user.id][day] = b.hrSamples;
+    }
+    daysUpdated++;
+  }
+
+  return {
+    serial: user.ringSerial,
+    eventsIngested,
+    maxCursor: maxRingTs,
+    batteryPercent: user.ringBattery,
+    firmware: user.ringFirmware,
+    daysUpdated
+  };
+}
+
 // --- Seed Generator for Static Mode ---
 async function createInitialStaticDbAsync() {
   const alexHash = await hashPasswordBrowser('laura2026');
@@ -266,8 +741,8 @@ async function createInitialStaticDbAsync() {
     const isMaya = u.id === 2;
 
     for (let i = 89; i >= 0; i--) {
-      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
-      const dayStr = d.toISOString().slice(0, 10);
+      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i, 12, 0, 0);
+      const dayStr = toLocalDayStr(d);
       const wave = Math.sin((i + u.id * 4) * 0.35);
       const wave2 = Math.cos((i + u.id * 2) * 0.22);
 
@@ -289,8 +764,9 @@ async function createInitialStaticDbAsync() {
 
       const bedStartHour = isMaya ? 22.5 : 22.75;
       const bedStartMinOffset = Math.round((bedStartHour - 22) * 60 + wave2 * 18);
-      const bedStartDate = new Date(`${dayStr}T00:00:00Z`);
-      bedStartDate.setUTCMinutes(bedStartDate.getUTCMinutes() - (120 - bedStartMinOffset));
+      // Anchor bedtime to local device clock midnight (never UTC 'Z') so 10:45 PM is 10:45 PM local time!
+      const bedStartDate = localDayDate(dayStr, 0, 0, 0);
+      bedStartDate.setMinutes(bedStartDate.getMinutes() - (120 - bedStartMinOffset));
       const bedEndDate = new Date(bedStartDate.getTime() + timeInBedSeconds * 1000);
 
       const tags = [];
@@ -303,6 +779,7 @@ async function createInitialStaticDbAsync() {
       summaries[u.id][dayStr] = {
         userId: u.id,
         day: dayStr,
+        isDemo: true,
         readiness: {
           score: readinessScore,
           tempDeviation: Number((wave * 0.14).toFixed(2)),
@@ -364,8 +841,7 @@ async function createInitialStaticDbAsync() {
       if (i < 14) {
         const samples = [];
         for (let h = 0; h < 48; h++) {
-          const ts = new Date(`${dayStr}T00:00:00Z`);
-          ts.setUTCMinutes(h * 30);
+          const ts = localDayDate(dayStr, 0, h * 30, 0);
           const asleep = h < 14 || h >= 45;
           const bpm = asleep
             ? Math.round(lowestHr + 3 + Math.sin(h * 0.5) * 3)
@@ -424,14 +900,62 @@ async function loadDbAsync() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      // Ensure all users have PBKDF2 password hashes
+      let mutated = false;
+      const hadBleSyncInLogs = (parsed.syncLogs || []).some(
+        (l) => l.message && l.message.includes('open_oura BLE binary sync')
+      );
+
       for (const u of parsed.users || []) {
         if (!u.passwordHash) {
           u.passwordHash = await hashPasswordBrowser('laura2026');
           u.isDefaultPassword = true;
+          mutated = true;
+        }
+        const userDays = parsed.summaries?.[u.id] || {};
+        const userSyncedBle =
+          Boolean(u.hasSyncedRealRing) ||
+          (u.id === 1 && u.ringCursor && u.ringCursor !== 142800) ||
+          (u.id === 2 && u.ringCursor && u.ringCursor !== 138400) ||
+          (u.id === 1 && hadBleSyncInLogs);
+
+        if (userSyncedBle && !u.hasSyncedRealRing) {
+          u.hasSyncedRealRing = true;
+          mutated = true;
+        }
+
+        for (const [dayKey, s] of Object.entries(userDays)) {
+          const isSyntheticSeed =
+            s.isDemo === true || s.sleep?.hypnogram5min === '422111223322112233322123324';
+          if (isSyntheticSeed && s.isDemo === undefined) {
+            s.isDemo = true;
+            mutated = true;
+          }
+          // If this user has synced their physical ring, remove pre-seeded demo days so unsynced days don't show fake stats!
+          if (userSyncedBle && isSyntheticSeed) {
+            delete userDays[dayKey];
+            if (parsed.heartrates?.[u.id]) delete parsed.heartrates[u.id][dayKey];
+            mutated = true;
+            continue;
+          }
+          // Fix any bedtimeStart/bedtimeEnd that was previously stored with UTC 'Z' (starting around 3-5 PM local time)
+          if (s.sleep?.bedtimeStart) {
+            const bd = new Date(s.sleep.bedtimeStart);
+            const localHr = bd.getHours();
+            const tzOffsetMs = bd.getTimezoneOffset() * 60 * 1000;
+            if (tzOffsetMs !== 0 && localHr >= 13 && localHr <= 18) {
+              const fixedStart = new Date(bd.getTime() + tzOffsetMs);
+              s.sleep.bedtimeStart = fixedStart.toISOString();
+              if (s.sleep.bedtimeEnd) {
+                const ed = new Date(s.sleep.bedtimeEnd);
+                s.sleep.bedtimeEnd = new Date(ed.getTime() + tzOffsetMs).toISOString();
+              }
+              mutated = true;
+            }
+          }
         }
       }
       if (!Array.isArray(parsed.sessions)) parsed.sessions = [];
+      if (mutated) saveDb(parsed);
       return parsed;
     }
   } catch {}
@@ -490,15 +1014,20 @@ function computeBaselines(db, userId, upToDay, windowDays = 30) {
 
 function buildStaticCoupleComparison(db, day) {
   const members = db.users.filter((u) => u.shareWithHousehold).map((u) => {
-    const summary = db.summaries[u.id]?.[day] || Object.values(db.summaries[u.id] || {}).slice(-1)[0];
+    const summary = db.summaries[u.id]?.[day] || null;
     const baseline = computeBaselines(db, u.id, day, 30);
+    const allUserDays = Object.values(db.summaries[u.id] || {})
+      .filter((s) => s.day <= day)
+      .sort((a, b) => a.day.localeCompare(b.day));
     return {
       user: sanitizeUser(u),
       summary,
       baseline,
+      series14: allUserDays.slice(-14),
+      series30: allUserDays.slice(-30),
       deltas: {
-        rhrDelta: summary?.sleep?.lowestHr != null ? Number((summary.sleep.lowestHr - baseline.lowestHr).toFixed(1)) : 0,
-        hrvDelta: summary?.sleep?.averageHrv != null ? Math.round(summary.sleep.averageHrv - baseline.averageHrv) : 0
+        rhrDelta: summary?.sleep?.lowestHr != null ? Number((summary.sleep.lowestHr - baseline.lowestHr).toFixed(1)) : null,
+        hrvDelta: summary?.sleep?.averageHrv != null ? Math.round(summary.sleep.averageHrv - baseline.averageHrv) : null
       }
     };
   });
@@ -557,10 +1086,10 @@ function buildStaticCoupleComparison(db, day) {
 function buildStaticCorrelations(db, userId, endDay, days, metricX, metricY) {
   const metricDefs = [
     { key: 'bedtime_hour', label: 'Bedtime Hour (24h)', unit: 'hr', extract: (s) => {
-      if (!s.sleep?.bedtimeStart) return 22.8;
+      if (!s.sleep?.bedtimeStart) return null;
       const d = new Date(s.sleep.bedtimeStart);
-      const h = d.getUTCHours() + d.getUTCMinutes() / 60;
-      return Number((h < 12 ? h + 24 : h).toFixed(2));
+      const h = d.getHours() + d.getMinutes() / 60;
+      return Number((h < 14 ? h + 24 : h).toFixed(2));
     }},
     { key: 'deep_sleep_minutes', label: 'Deep Sleep', unit: 'min', extract: (s) => Math.round((s.sleep?.deepSeconds || 0) / 60) },
     { key: 'average_hrv', label: 'Nighttime HRV', unit: 'ms', extract: (s) => s.sleep?.averageHrv },
@@ -728,8 +1257,8 @@ export async function handleStaticApi(pathStr, options = {}) {
     };
 
     db.users.push(newUser);
-    db.summaries[newId] = { ...(db.summaries[1] || {}) };
-    db.heartrates[newId] = { ...(db.heartrates[1] || {}) };
+    db.summaries[newId] = {};
+    db.heartrates[newId] = {};
     db.ringEvents[newId] = [];
     saveDb(db);
 
@@ -860,8 +1389,13 @@ export async function handleStaticApi(pathStr, options = {}) {
           reqBattery: '0c00',
           reqSerial: '1803080010',
           reqAuthNonce: '2f012b',
+          reqSyncTime: buildSyncTimeHexBrowser(),
           reqCheckSleepAnalysis: '280101',
-          reqGetEventFromCursor: '100900000000fffeffffff'
+          reqGetEventFromCursor: '10090000000000ffffffff',
+          enableDaytimeHr: '2f03220201',
+          enableExerciseHr: '2f03220301',
+          enableSpo2: '2f03220401',
+          enableRestingHr: '2f03220801'
         }
       }
     };
@@ -904,24 +1438,85 @@ export async function handleStaticApi(pathStr, options = {}) {
     };
   }
 
-  if ((pathname === '/api/ring/sync' || pathname === '/api/oura/sync' || pathname === '/api/ring/ingest') && method === 'POST') {
+  if (pathname === '/api/ring/ingest' && method === 'POST') {
     const nowIso = new Date().toISOString();
     currentUser.lastSyncedAt = nowIso;
-    currentUser.ringCursor = (currentUser.ringCursor || 140000) + 1260;
+    const notificationsHex = Array.isArray(body.notificationsHex) ? body.notificationsHex : [];
+    const serial = String(body.serial || currentUser.ringSerial || `OURA3-${currentUser.id}`).trim();
+    const phoneUnix = Number(body.phoneUnix || Math.floor(Date.now() / 1000));
+
+    const result = ingestBleNotificationsBrowser(db, currentUser, {
+      serial,
+      notificationsHex,
+      phoneUnix,
+      clearDemo: true
+    });
+
     db.syncLogs.unshift({
       startedAt: nowIso,
-      finishedAt: nowIso,
+      finishedAt: new Date().toISOString(),
       status: 'success',
-      daysSynced: 7,
-      message: `open_oura BLE binary sync (${currentUser.ringSerial}): decoded 126 packets → updated 7 days locally.`
+      daysSynced: result.daysUpdated,
+      message: `open_oura BLE binary sync (${result.serial}): decoded ${result.eventsIngested} packets → updated ${result.daysUpdated} day(s) in local device time.`
     });
     saveDb(db);
     return {
       ok: true,
-      eventsIngested: 126,
-      daysSynced: 7,
-      daysUpdated: 7,
-      message: 'Decoded 126 open_oura BLE binary packets and scored 7 days locally.'
+      ...result,
+      daysSynced: result.daysUpdated,
+      user: sanitizeUser(currentUser),
+      message:
+        result.daysUpdated > 0
+          ? `Decoded ${result.eventsIngested} open_oura BLE packets and updated ${result.daysUpdated} synced day(s).`
+          : `Connected to ${result.serial} (${result.eventsIngested} packets). No completed sleep sessions on ring yet — unsynced days cleared.`
+    };
+  }
+
+  if (pathname === '/api/ring/clear-demo' && method === 'POST') {
+    const userDays = db.summaries[currentUser.id] || {};
+    let removed = 0;
+    for (const k of Object.keys(userDays)) {
+      if (userDays[k]?.isDemo || userDays[k]?.sleep?.hypnogram5min === '422111223322112233322123324') {
+        delete userDays[k];
+        if (db.heartrates[currentUser.id]) delete db.heartrates[currentUser.id][k];
+        removed++;
+      }
+    }
+    currentUser.hasSyncedRealRing = true;
+    saveDb(db);
+    const remaining = Object.keys(db.summaries[currentUser.id] || {}).length;
+    return {
+      ok: true,
+      removedDays: removed,
+      daysSynced: remaining,
+      message:
+        remaining > 0
+          ? `Cleared ${removed} demo days. Showing only your ${remaining} real synced ring day(s).`
+          : `Cleared ${removed} demo days. Unsynced days now show 0 / No Data until your ring syncs.`
+    };
+  }
+
+  if ((pathname === '/api/ring/sync' || pathname === '/api/oura/sync') && method === 'POST') {
+    const nowIso = new Date().toISOString();
+    currentUser.lastSyncedAt = nowIso;
+    const syncedCount = Object.keys(db.summaries[currentUser.id] || {}).length;
+    db.syncLogs.unshift({
+      startedAt: nowIso,
+      finishedAt: nowIso,
+      status: 'success',
+      daysSynced: syncedCount,
+      message: `Refreshed ${syncedCount} synced day(s) for ${currentUser.ringSerial}.`
+    });
+    saveDb(db);
+    return {
+      ok: true,
+      eventsIngested: 0,
+      daysSynced: syncedCount,
+      daysUpdated: syncedCount,
+      message:
+        syncedCount > 0
+          ? `Refreshed ${syncedCount} synced day(s) in local device time.`
+          : 'No synced ring data yet. Go to Settings → Pair / Sync Ring via Bluetooth.'
     };
   }
 
@@ -929,9 +1524,10 @@ export async function handleStaticApi(pathStr, options = {}) {
     const targetUserId = Number(url.searchParams.get('userId') || currentUser.id);
     const userDays = db.summaries[targetUserId] || {};
     const allKeys = Object.keys(userDays).sort();
-    const latestDay = allKeys[allKeys.length - 1] || new Date().toISOString().slice(0, 10);
+    const latestDay = allKeys[allKeys.length - 1] || toLocalDayStr();
     const day = url.searchParams.get('day') || latestDay;
-    const summary = userDays[day] || userDays[latestDay];
+    // Never fall back to latestDay when viewing an unsynced day!
+    const summary = userDays[day] || null;
     const baseline = computeBaselines(db, targetUserId, day, 30);
     const recent7 = allKeys.filter((d) => d <= day).slice(-7).map((d) => userDays[d]);
 
@@ -939,9 +1535,10 @@ export async function handleStaticApi(pathStr, options = {}) {
       user: sanitizeUser(db.users.find((u) => u.id === targetUserId) || currentUser),
       day,
       latestDay,
+      syncedDays: allKeys,
       summary,
       baseline,
-      heartrate: db.heartrates[targetUserId]?.[day] || db.heartrates[targetUserId]?.[latestDay] || [],
+      heartrate: db.heartrates[targetUserId]?.[day] || [],
       workouts: [],
       recent7
     };
@@ -960,7 +1557,7 @@ export async function handleStaticApi(pathStr, options = {}) {
 
   if (pathname === '/api/dashboard/couple' && method === 'GET') {
     const allKeys = Object.keys(db.summaries[currentUser.id] || {}).sort();
-    const latestDay = allKeys[allKeys.length - 1] || new Date().toISOString().slice(0, 10);
+    const latestDay = allKeys[allKeys.length - 1] || toLocalDayStr();
     const day = url.searchParams.get('day') || latestDay;
     return buildStaticCoupleComparison(db, day);
   }

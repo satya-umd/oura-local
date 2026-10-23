@@ -1,4 +1,4 @@
-import { handleStaticApi } from './static-backend.js?v=6';
+import { handleStaticApi } from './static-backend.js?v=7';
 
 const IS_GITHUB_PAGES = typeof window !== 'undefined' && window.location.hostname.endsWith('github.io');
 
@@ -84,11 +84,46 @@ function formatDuration(sec) {
   return hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
 }
 
+function localTodayStr(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function getDeviceTimezoneLabel() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local Time';
+    const shortTz = new Date()
+      .toLocaleTimeString([], { timeZoneName: 'short' })
+      .split(' ')
+      .pop();
+    return shortTz && shortTz !== tz ? `${tz} (${shortTz})` : tz;
+  } catch {
+    return 'Device Local Time';
+  }
+}
+
 function formatClock(isoStr) {
   if (!isoStr) return '--:--';
   const d = new Date(isoStr);
   if (Number.isNaN(d.getTime())) return '--:--';
   return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function formatSleepTimelineTicks(startIso, endIso) {
+  if (!startIso || !endIso) {
+    return ['--:--', '--:--', '--:--', '--:--', '--:--'];
+  }
+  const s = new Date(startIso).getTime();
+  const e = new Date(endIso).getTime();
+  if (Number.isNaN(s) || Number.isNaN(e) || e <= s) {
+    return [formatClock(startIso), '', 'Mid-Sleep', '', formatClock(endIso)];
+  }
+  return [0, 0.25, 0.5, 0.75, 1].map((frac) =>
+    formatClock(new Date(s + (e - s) * frac).toISOString())
+  );
 }
 
 function scoreColor(score) {
@@ -106,15 +141,15 @@ function scoreLabel(score) {
 }
 
 function shiftDay(dayStr, deltaDays) {
-  const d = new Date(`${dayStr}T12:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + deltaDays);
-  return d.toISOString().slice(0, 10);
+  const [y, m, d] = String(dayStr || localTodayStr()).split('-').map(Number);
+  const dt = new Date(y, (m || 1) - 1, (d || 1) + deltaDays, 12, 0, 0);
+  return localTodayStr(dt);
 }
 
 async function initApp() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker
-      .register('./sw.js?v=6')
+      .register('./sw.js?v=7')
       .then((reg) => reg.update().catch(() => {}))
       .catch(() => {});
   }
@@ -309,8 +344,8 @@ function renderNightCurveSvg(values, color, label, unit) {
 }
 
 function render24hHeartrateSvg(samples) {
-  if (!Array.isArray(samples) || samples.length < 4) {
-    return `<div style="color:var(--text-muted);font-size:0.84rem;padding:18px 0;">Intraday 24-hour heart rate points are available for recent synced days.</div>`;
+  if (!Array.isArray(samples) || samples.length < 2) {
+    return `<div style="color:var(--text-muted);font-size:0.84rem;padding:18px 0;">No intraday heart rate points synced for this date (0 samples).</div>`;
   }
   const w = 680;
   const h = 165;
@@ -322,11 +357,19 @@ function render24hHeartrateSvg(samples) {
   const avgBpm = Math.round(bpms.reduce((a, b) => a + b, 0) / bpms.length);
   const span = Math.max(10, maxBpm - minBpm);
 
-  const pts = samples.map((s, i) => {
-    const x = padX + (i / (samples.length - 1)) * (w - padX * 2);
-    const y = h - padY - ((s.bpm - minBpm) / span) * (h - padY * 2);
-    return { x, y, bpm: s.bpm, source: s.source };
-  });
+  // Position each point by its local device clock minute of the day (00:00 -> 24:00 local time)
+  const pts = samples
+    .map((s, i) => {
+      const dt = s.timestamp ? new Date(s.timestamp) : null;
+      const validDate = dt && !Number.isNaN(dt.getTime());
+      const minsOfDay = validDate
+        ? dt.getHours() * 60 + dt.getMinutes()
+        : (i / Math.max(1, samples.length - 1)) * 1440;
+      const x = padX + (Math.max(0, Math.min(1440, minsOfDay)) / 1440) * (w - padX * 2);
+      const y = h - padY - ((s.bpm - minBpm) / span) * (h - padY * 2);
+      return { x, y, minsOfDay, bpm: s.bpm, source: s.source };
+    })
+    .sort((a, b) => a.minsOfDay - b.minsOfDay);
 
   const lineStr = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
   const sourceColor = (src) =>
@@ -346,7 +389,7 @@ function render24hHeartrateSvg(samples) {
       <svg viewBox="0 0 ${w} ${h}" style="width:100%;height:165px;">
         <polyline fill="none" stroke="rgba(239, 68, 68, 0.55)" stroke-width="2" points="${lineStr}" />
         ${pts
-          .filter((_, idx) => idx % 2 === 0)
+          .filter((_, idx) => samples.length <= 36 || idx % 2 === 0)
           .map(
             (p) =>
               `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.8" fill="${sourceColor(p.source)}" />`
@@ -354,11 +397,11 @@ function render24hHeartrateSvg(samples) {
           .join('')}
       </svg>
       <div style="display:flex;justify-content:space-between;font-size:0.72rem;color:var(--text-muted);padding:0 12px;">
-        <span>00:00</span>
-        <span>06:00</span>
-        <span>12:00</span>
-        <span>18:00</span>
-        <span>23:45</span>
+        <span>12:00 AM</span>
+        <span>6:00 AM</span>
+        <span>12:00 PM</span>
+        <span>6:00 PM</span>
+        <span>11:59 PM</span>
       </div>
     </div>
   `;
@@ -477,57 +520,177 @@ function renderAuthView() {
 
 function renderTodayView() {
   const d = state.dailyData;
+  const selectedDay = state.selectedDay || d?.day || localTodayStr();
+  const syncedDays = d?.syncedDays || [];
+  const hasAnySyncedDays = syncedDays.length > 0;
+  const latestSyncedDay = syncedDays[syncedDays.length - 1] || null;
+  const tzLabel = getDeviceTimezoneLabel();
+
   if (!d || !d.summary) {
-    return `<div class="card"><p>No Oura Ring summary found for ${escapeHtml(state.selectedDay || 'this date')}. Try selecting another date or syncing your ring.</p></div>`;
+    return `
+      <!-- Prominent Unsynced Date Notice -->
+      <div class="card" style="margin-bottom:18px;border:1px solid rgba(245,158,11,0.4);background:rgba(245,158,11,0.08);">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div>
+            <div style="font-weight:700;font-size:1.02rem;color:#fcd34d;">
+              ⚠️ No Existing Oura Ring Data Synced for ${escapeHtml(selectedDay)}
+            </div>
+            <div style="font-size:0.84rem;color:var(--text-secondary);margin-top:4px;">
+              Your ring has not synced any sleep or biometric data for <strong>${escapeHtml(selectedDay)}</strong>. All stats for this date are set to <strong>0 / No Data</strong>.
+              ${
+                hasAnySyncedDays
+                  ? `You have <strong>${syncedDays.length}</strong> synced day(s) available (latest: <strong>${escapeHtml(latestSyncedDay)}</strong>).`
+                  : `Pair or sync your ring over Bluetooth in <strong>Settings</strong> to populate your real metrics.`
+              }
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            ${
+              latestSyncedDay && latestSyncedDay !== selectedDay
+                ? `<button type="button" class="btn btn-primary" data-jump-day="${escapeHtml(latestSyncedDay)}">📅 Jump to Latest Synced (${escapeHtml(latestSyncedDay)})</button>`
+                : ''
+            }
+            <button type="button" class="btn" data-nav="settings">🔵 Sync Ring via Bluetooth</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Zeroed Score Cards for Unsynced Day -->
+      <div class="grid-3">
+        ${renderScoreRingCard('Readiness', 0, null, [
+          { label: 'HRV Balance', value: 0, display: '0 (No Data)' },
+          { label: 'Resting Heart Rate', value: 0, display: '0 (No Data)' },
+          { label: 'Sleep Balance', value: 0, display: '0 (No Data)' },
+          { label: 'Recovery Index', value: 0, display: '0 (No Data)' }
+        ])}
+        ${renderScoreRingCard('Sleep', 0, null, [
+          { label: 'Total Sleep', value: 0, display: '0h 0m' },
+          { label: 'Deep Sleep', value: 0, display: '0h 0m (0%)' },
+          { label: 'REM Sleep', value: 0, display: '0h 0m (0%)' },
+          { label: 'Sleep Efficiency', value: 0, display: '0%' }
+        ])}
+        ${renderScoreRingCard('Activity', 0, null, [
+          { label: 'Steps', value: 0, display: '0' },
+          { label: 'Active Calories', value: 0, display: '0 kcal' },
+          { label: 'Walking Distance', value: 0, display: '0.0 km' },
+          { label: 'Activity Balance', value: 0, display: '0 (No Data)' }
+        ])}
+      </div>
+
+      <!-- Zeroed Biometric Vitals Grid for Unsynced Day -->
+      <div class="vitals-grid">
+        <div class="vital-card">
+          <div class="vital-label">Lowest Resting HR</div>
+          <div class="vital-value">0 <span class="vital-unit">bpm</span></div>
+          <div class="vital-delta delta-neutral">No data synced for ${escapeHtml(selectedDay)}</div>
+        </div>
+        <div class="vital-card">
+          <div class="vital-label">Nighttime HRV</div>
+          <div class="vital-value">0 <span class="vital-unit">ms</span></div>
+          <div class="vital-delta delta-neutral">No data synced for ${escapeHtml(selectedDay)}</div>
+        </div>
+        <div class="vital-card">
+          <div class="vital-label">Body Temp Deviation</div>
+          <div class="vital-value">0.0 <span class="vital-unit">°C</span></div>
+          <div class="vital-delta delta-neutral">No data synced for ${escapeHtml(selectedDay)}</div>
+        </div>
+        <div class="vital-card">
+          <div class="vital-label">Blood Oxygen (SpO2)</div>
+          <div class="vital-value">0 <span class="vital-unit">%</span></div>
+          <div class="vital-delta delta-neutral">No data synced for ${escapeHtml(selectedDay)}</div>
+        </div>
+        <div class="vital-card">
+          <div class="vital-label">Daytime Stress / Recovery</div>
+          <div class="vital-value">0m <span class="vital-unit">/ 0m rec</span></div>
+          <div class="vital-delta delta-neutral">No data synced for ${escapeHtml(selectedDay)}</div>
+        </div>
+        <div class="vital-card">
+          <div class="vital-label">Respiratory Rate</div>
+          <div class="vital-value">0 <span class="vital-unit">br/min</span></div>
+          <div class="vital-delta delta-neutral">No data synced for ${escapeHtml(selectedDay)}</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Sleep Stage Hypnogram & Window</div>
+            <div class="card-subtitle">No sleep session recorded for ${escapeHtml(selectedDay)} • Clock: ${escapeHtml(tzLabel)}</div>
+          </div>
+        </div>
+        <div style="color:var(--text-muted);font-size:0.86rem;padding:12px 0;">
+          No sleep or heart rate timeline exists for <strong>${escapeHtml(selectedDay)}</strong>. Wear your Oura Ring overnight and sync via Bluetooth in the morning.
+        </div>
+      </div>
+    `;
   }
 
   const s = d.summary;
   const b = d.baseline || {};
-  const rScore = s.readiness?.score;
-  const slScore = s.sleep?.score;
-  const actScore = s.activity?.score;
+  const rScore = s.readiness?.score ?? 0;
+  const slScore = s.sleep?.score ?? 0;
+  const actScore = s.activity?.score ?? 0;
+  const hasSleepSession = (s.sleep?.totalSeconds || 0) > 0;
 
   const rhrDelta =
     s.sleep?.lowestHr != null && b.lowestHr != null ? Number((s.sleep.lowestHr - b.lowestHr).toFixed(1)) : null;
   const hrvDelta =
     s.sleep?.averageHrv != null && b.averageHrv != null ? Math.round(s.sleep.averageHrv - b.averageHrv) : null;
 
-  const totalSl = Math.max(1, s.sleep?.totalSeconds || 1);
-  const deepPct = Math.round(((s.sleep?.deepSeconds || 0) / totalSl) * 100);
-  const remPct = Math.round(((s.sleep?.remSeconds || 0) / totalSl) * 100);
-  const lightPct = Math.max(0, 100 - deepPct - remPct);
+  const totalSl = Math.max(1, s.sleep?.totalSeconds || 0);
+  const deepPct = hasSleepSession ? Math.round(((s.sleep?.deepSeconds || 0) / totalSl) * 100) : 0;
+  const remPct = hasSleepSession ? Math.round(((s.sleep?.remSeconds || 0) / totalSl) * 100) : 0;
+  const lightPct = hasSleepSession ? Math.max(0, 100 - deepPct - remPct) : 0;
 
   const hypnoChars = (s.sleep?.hypnogram5min || '').split('');
+  const sleepTicks = formatSleepTimelineTicks(s.sleep?.bedtimeStart, s.sleep?.bedtimeEnd);
 
   return `
+    ${
+      s.isDemo
+        ? `
+      <div class="card" style="margin-bottom:16px;padding:12px 16px;border:1px solid rgba(99,102,241,0.35);background:rgba(99,102,241,0.1);">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+          <div style="font-size:0.82rem;color:var(--text-secondary);">
+            💡 <strong>Pre-Seeded Demo Preview:</strong> Using your real Oura Ring? Click <strong>Clear Demo Data</strong> so unsynced days show <strong>0 / No Data</strong> and only your real synced ring days appear.
+          </div>
+          <button type="button" class="btn btn-primary" data-clear-demo-btn="1" style="padding:6px 12px;font-size:0.78rem;">
+            🧹 Clear Unsynced / Demo Data
+          </button>
+        </div>
+      </div>
+    `
+        : ''
+    }
+
     <!-- 3 Primary Oura Score Cards -->
     <div class="grid-3">
       ${renderScoreRingCard('Readiness', rScore, b.readiness, [
-        { label: 'HRV Balance', value: s.readiness?.contributors?.hrvBalance },
-        { label: 'Resting Heart Rate', value: s.readiness?.contributors?.restingHeartRate },
-        { label: 'Sleep Balance', value: s.readiness?.contributors?.sleepBalance },
-        { label: 'Recovery Index', value: s.readiness?.contributors?.recoveryIndex }
+        { label: 'HRV Balance', value: s.readiness?.contributors?.hrvBalance ?? 0 },
+        { label: 'Resting Heart Rate', value: s.readiness?.contributors?.restingHeartRate ?? 0 },
+        { label: 'Sleep Balance', value: s.readiness?.contributors?.sleepBalance ?? 0 },
+        { label: 'Recovery Index', value: s.readiness?.contributors?.recoveryIndex ?? 0 }
       ])}
       ${renderScoreRingCard('Sleep', slScore, b.sleep, [
         {
           label: 'Total Sleep',
           value: Math.min(100, Math.round(((s.sleep?.totalSeconds || 0) / 28800) * 100)),
-          display: formatDuration(s.sleep?.totalSeconds)
+          display: formatDuration(s.sleep?.totalSeconds || 0)
         },
         {
           label: 'Deep Sleep',
           value: Math.min(100, Math.round(((s.sleep?.deepSeconds || 0) / 5400) * 100)),
-          display: `${formatDuration(s.sleep?.deepSeconds)} (${deepPct}%)`
+          display: `${formatDuration(s.sleep?.deepSeconds || 0)} (${deepPct}%)`
         },
         {
           label: 'REM Sleep',
           value: Math.min(100, Math.round(((s.sleep?.remSeconds || 0) / 6000) * 100)),
-          display: `${formatDuration(s.sleep?.remSeconds)} (${remPct}%)`
+          display: `${formatDuration(s.sleep?.remSeconds || 0)} (${remPct}%)`
         },
         {
           label: 'Sleep Efficiency',
           value: s.sleep?.efficiency || 0,
-          display: `${s.sleep?.efficiency ?? '--'}%`
+          display: `${s.sleep?.efficiency ?? 0}%`
         }
       ])}
       ${renderScoreRingCard('Activity', actScore, b.activity, [
@@ -548,7 +711,7 @@ function renderTodayView() {
         },
         {
           label: 'Activity Balance',
-          value: s.readiness?.contributors?.activityBalance || 80
+          value: s.readiness?.contributors?.activityBalance ?? 0
         }
       ])}
     </div>
@@ -557,36 +720,36 @@ function renderTodayView() {
     <div class="vitals-grid">
       <div class="vital-card">
         <div class="vital-label">Lowest Resting HR</div>
-        <div class="vital-value">${s.sleep?.lowestHr ?? '--'} <span class="vital-unit">bpm</span></div>
-        <div class="vital-delta ${rhrDelta != null && rhrDelta <= 0 ? 'delta-good' : 'delta-warn'}">
-          ${rhrDelta != null ? `${rhrDelta > 0 ? '+' : ''}${rhrDelta} bpm vs 30d (${b.lowestHr})` : '30d baseline'}
+        <div class="vital-value">${s.sleep?.lowestHr ?? 0} <span class="vital-unit">bpm</span></div>
+        <div class="vital-delta ${rhrDelta != null && rhrDelta <= 0 ? 'delta-good' : 'delta-neutral'}">
+          ${rhrDelta != null ? `${rhrDelta > 0 ? '+' : ''}${rhrDelta} bpm vs 30d (${b.lowestHr})` : 'No RHR recorded yet'}
         </div>
       </div>
 
       <div class="vital-card">
         <div class="vital-label">Nighttime HRV</div>
-        <div class="vital-value">${s.sleep?.averageHrv ?? '--'} <span class="vital-unit">ms</span></div>
-        <div class="vital-delta ${hrvDelta != null && hrvDelta >= 0 ? 'delta-good' : 'delta-warn'}">
-          ${hrvDelta != null ? `${hrvDelta > 0 ? '+' : ''}${hrvDelta} ms vs 30d (${b.averageHrv})` : '30d baseline'}
+        <div class="vital-value">${s.sleep?.averageHrv ?? 0} <span class="vital-unit">ms</span></div>
+        <div class="vital-delta ${hrvDelta != null && hrvDelta >= 0 ? 'delta-good' : 'delta-neutral'}">
+          ${hrvDelta != null ? `${hrvDelta > 0 ? '+' : ''}${hrvDelta} ms vs 30d (${b.averageHrv})` : 'No HRV recorded yet'}
         </div>
       </div>
 
       <div class="vital-card">
         <div class="vital-label">Body Temp Deviation</div>
         <div class="vital-value">
-          ${s.readiness?.tempDeviation != null ? `${s.readiness.tempDeviation > 0 ? '+' : ''}${s.readiness.tempDeviation}` : '--'}
+          ${s.readiness?.tempDeviation != null ? `${s.readiness.tempDeviation > 0 ? '+' : ''}${s.readiness.tempDeviation}` : '0.0'}
           <span class="vital-unit">°C</span>
         </div>
         <div class="vital-delta ${Math.abs(s.readiness?.tempDeviation || 0) <= 0.2 ? 'delta-good' : 'delta-warn'}">
-          ${Math.abs(s.readiness?.tempDeviation || 0) <= 0.2 ? 'Within normal range' : 'Elevated shift'}
+          ${s.readiness?.tempDeviation != null ? (Math.abs(s.readiness.tempDeviation) <= 0.2 ? 'Within normal range' : 'Elevated shift') : 'No temp recorded yet'}
         </div>
       </div>
 
       <div class="vital-card">
         <div class="vital-label">Blood Oxygen (SpO2)</div>
-        <div class="vital-value">${s.spo2?.percentage ?? '--'} <span class="vital-unit">%</span></div>
+        <div class="vital-value">${s.spo2?.percentage ?? 0} <span class="vital-unit">%</span></div>
         <div class="vital-delta delta-good">
-          Breathing regularity: ${(s.spo2?.breathingDisturbanceIndex ?? 0) < 1.5 ? 'Optimal' : 'Check'}
+          ${s.spo2?.percentage != null ? `Breathing regularity: ${(s.spo2?.breathingDisturbanceIndex ?? 0) < 1.5 ? 'Optimal' : 'Check'}` : 'No SpO2 recorded yet'}
         </div>
       </div>
 
@@ -597,13 +760,13 @@ function renderTodayView() {
           <span class="vital-unit">/ ${Math.round((s.stress?.recoveryHighSeconds || 0) / 60)}m rec</span>
         </div>
         <div class="vital-delta ${s.stress?.daySummary === 'restored' ? 'delta-good' : 'delta-neutral'}">
-          Day summary: ${escapeHtml(s.stress?.daySummary || 'balanced')}
+          Day summary: ${escapeHtml(s.stress?.daySummary || 'no data')}
         </div>
       </div>
 
       <div class="vital-card">
         <div class="vital-label">Respiratory Rate</div>
-        <div class="vital-value">${s.sleep?.averageBreath ?? '--'} <span class="vital-unit">br/min</span></div>
+        <div class="vital-value">${s.sleep?.averageBreath ?? 0} <span class="vital-unit">br/min</span></div>
         <div class="vital-delta delta-neutral">
           Latency: ${Math.round((s.sleep?.latencySeconds || 0) / 60)} min to fall asleep
         </div>
@@ -612,47 +775,53 @@ function renderTodayView() {
 
     <!-- Sleep Stage Hypnogram & Architecture -->
     <div class="card" style="margin-bottom:18px;">
-      <div class="card-header">
+      <div class="card-header" style="flex-wrap:wrap;gap:8px;">
         <div>
           <div class="card-title">Sleep Stage Hypnogram & Window</div>
           <div class="card-subtitle">
-            Bedtime ${formatClock(s.sleep?.bedtimeStart)} → Wake ${formatClock(s.sleep?.bedtimeEnd)}
-            • Time in Bed: ${formatDuration(s.sleep?.timeInBedSeconds)} • Asleep: ${formatDuration(s.sleep?.totalSeconds)}
+            ${
+              hasSleepSession
+                ? `Bedtime ${formatClock(s.sleep?.bedtimeStart)} → Wake ${formatClock(s.sleep?.bedtimeEnd)} • Time in Bed: ${formatDuration(s.sleep?.timeInBedSeconds)} • Asleep: ${formatDuration(s.sleep?.totalSeconds)}`
+                : `No completed sleep session synced for ${escapeHtml(selectedDay)} yet (0h 0m)`
+            }
           </div>
         </div>
+        <span class="tag-chip" style="font-size:0.72rem;">🕒 ${escapeHtml(tzLabel)}</span>
       </div>
 
       ${
-        hypnoChars.length > 0
+        hasSleepSession && hypnoChars.length > 0
           ? `
         <div class="hypnogram-bars">
           ${hypnoChars.map((ch) => `<div class="hypno-slice hypno-stage-${escapeHtml(ch)}"></div>`).join('')}
         </div>
-        <div style="display:flex;justify-content:space-between;font-size:0.74rem;color:var(--text-muted);">
-          <span>${formatClock(s.sleep?.bedtimeStart)}</span>
-          <span>Mid-Sleep</span>
-          <span>${formatClock(s.sleep?.bedtimeEnd)}</span>
+        <div style="display:flex;justify-content:space-between;font-size:0.74rem;color:var(--text-muted);margin-top:4px;">
+          <span>${escapeHtml(sleepTicks[0])}</span>
+          <span>${escapeHtml(sleepTicks[1])}</span>
+          <span>${escapeHtml(sleepTicks[2])}</span>
+          <span>${escapeHtml(sleepTicks[3])}</span>
+          <span>${escapeHtml(sleepTicks[4])}</span>
         </div>
       `
-          : `<p style="color:var(--text-muted);font-size:0.84rem;">No 5-min hypnogram string recorded.</p>`
+          : `<p style="color:var(--text-muted);font-size:0.84rem;padding:10px 0;">No 5-minute sleep hypnogram recorded for this date yet (0h 0m).</p>`
       }
 
       <div class="hypno-legend">
         <div class="stage-pill">
           <div style="color:#f59e0b;font-weight:700;">● Awake</div>
-          <div>${formatDuration(s.sleep?.awakeSeconds)}</div>
+          <div>${formatDuration(s.sleep?.awakeSeconds || 0)}</div>
         </div>
         <div class="stage-pill">
           <div style="color:#06b6d4;font-weight:700;">● REM (${remPct}%)</div>
-          <div>${formatDuration(s.sleep?.remSeconds)}</div>
+          <div>${formatDuration(s.sleep?.remSeconds || 0)}</div>
         </div>
         <div class="stage-pill">
           <div style="color:#6366f1;font-weight:700;">● Light (${lightPct}%)</div>
-          <div>${formatDuration(s.sleep?.lightSeconds)}</div>
+          <div>${formatDuration(s.sleep?.lightSeconds || 0)}</div>
         </div>
         <div class="stage-pill">
           <div style="color:#8b5cf6;font-weight:700;">● Deep (${deepPct}%)</div>
-          <div>${formatDuration(s.sleep?.deepSeconds)}</div>
+          <div>${formatDuration(s.sleep?.deepSeconds || 0)}</div>
         </div>
       </div>
     </div>
@@ -1345,6 +1514,9 @@ function renderSettingsView() {
             <button type="button" id="ble-simulate-btn" class="btn btn-primary" title="Generates and decodes binary open_oura packets (0x76, 0x5a, 0x5d, 0x75, 0x6f, 0x50)">
               ⚡ Test open_oura Binary BLE Drain (7d)
             </button>
+            <button type="button" data-clear-demo-btn="1" class="btn" title="Removes pre-seeded demo days so unsynced days show 0 / No Data">
+              🧹 Clear Unsynced / Demo Data
+            </button>
           </div>
           ${
             state.bleStatus
@@ -1635,7 +1807,7 @@ function render() {
   }
 
   const members = state.session.householdMembers || [];
-  const currentDay = state.selectedDay || new Date().toISOString().slice(0, 10);
+  const currentDay = state.selectedDay || localTodayStr();
 
   const navItems = [
     {
@@ -1838,10 +2010,29 @@ function bindDashboardEvents() {
     });
   });
 
+  document.querySelectorAll('[data-jump-day]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.selectedDay = btn.getAttribute('data-jump-day');
+      loadCurrentTabData();
+    });
+  });
+
+  document.querySelectorAll('[data-clear-demo-btn]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        const res = await api('/api/ring/clear-demo', { method: 'POST', body: JSON.stringify({}) });
+        showToast(res.message || 'Cleared demo data!');
+        await loadCurrentTabData();
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
+
   const prevBtn = document.getElementById('prev-day-btn');
   if (prevBtn) {
     prevBtn.addEventListener('click', () => {
-      const cur = state.selectedDay || new Date().toISOString().slice(0, 10);
+      const cur = state.selectedDay || localTodayStr();
       state.selectedDay = shiftDay(cur, -1);
       loadCurrentTabData();
     });
@@ -1850,7 +2041,7 @@ function bindDashboardEvents() {
   const nextBtn = document.getElementById('next-day-btn');
   if (nextBtn) {
     nextBtn.addEventListener('click', () => {
-      const cur = state.selectedDay || new Date().toISOString().slice(0, 10);
+      const cur = state.selectedDay || localTodayStr();
       state.selectedDay = shiftDay(cur, 1);
       loadCurrentTabData();
     });
@@ -1859,7 +2050,7 @@ function bindDashboardEvents() {
   const latestBtn = document.getElementById('latest-day-btn');
   if (latestBtn) {
     latestBtn.addEventListener('click', () => {
-      state.selectedDay = state.dailyData?.latestDay || new Date().toISOString().slice(0, 10);
+      state.selectedDay = state.dailyData?.latestDay || localTodayStr();
       loadCurrentTabData();
     });
   }
@@ -2296,6 +2487,29 @@ function uint8ToHex(bytes) {
     .join('');
 }
 
+function buildLiveSyncTimeHex() {
+  const unixSecs = BigInt(Math.floor(Date.now() / 1000));
+  const tzHalfHours = Math.round(-new Date().getTimezoneOffset() / 30) & 0xff;
+  const bytes = new Uint8Array(11);
+  bytes[0] = 0x12;
+  bytes[1] = 0x09;
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(2, unixSecs, true);
+  bytes[10] = tzHalfHours;
+  return uint8ToHex(bytes);
+}
+
+function buildGetEventHex(startDeciseconds = 0, maxEvents = 0) {
+  const bytes = new Uint8Array(11);
+  bytes[0] = 0x10;
+  bytes[1] = 0x09;
+  const view = new DataView(bytes.buffer);
+  view.setUint32(2, startDeciseconds >>> 0, true);
+  bytes[6] = maxEvents & 0xff;
+  view.setInt32(7, -1, true);
+  return uint8ToHex(bytes);
+}
+
 async function runWebBluetoothRingSync({ pairNewKey = false } = {}) {
   if (!navigator.bluetooth) {
     showToast('WebBluetooth is not enabled in this browser. Use Chrome/Edge/Arc on Desktop, Bluefy on iOS, or click "Test open_oura Binary BLE Drain".');
@@ -2328,12 +2542,16 @@ async function runWebBluetoothRingSync({ pairNewKey = false } = {}) {
     const collectedNotificationsHex = [];
     let latestNonceHex = null;
     let authStatusByte = null;
+    let lastEventRxAt = 0;
+    let maxSeenRingTs = 0;
+    let batchEventCount = 0;
 
     await notifyChar.startNotifications();
     notifyChar.addEventListener('characteristicvaluechanged', (event) => {
       const val = new Uint8Array(event.target.value.buffer);
       const hex = uint8ToHex(val);
       collectedNotificationsHex.push(hex);
+      lastEventRxAt = Date.now();
 
       // Check for 0x2f 0x10 0x2c <15B nonce>
       if (val[0] === 0x2f && val[2] === 0x2c && val.length >= 18) {
@@ -2342,6 +2560,12 @@ async function runWebBluetoothRingSync({ pairNewKey = false } = {}) {
       // Check for 0x2f 0x02 0x2e <status>
       if (val[0] === 0x2f && val[2] === 0x2e && val.length >= 4) {
         authStatusByte = val[3];
+      }
+      // Track history event ringTimestamp (tag >= 0x41)
+      if (val[0] >= 0x41 && val.length >= 6) {
+        const ts = (val[2] | (val[3] << 8) | (val[4] << 16) | (val[5] << 24)) >>> 0;
+        if (ts > maxSeenRingTs) maxSeenRingTs = ts;
+        batchEventCount++;
       }
     });
 
@@ -2365,9 +2589,9 @@ async function runWebBluetoothRingSync({ pairNewKey = false } = {}) {
     // 1. Read Firmware, Battery, Serial
     state.bleStatus = 'Reading Ring Firmware (0x0a), Battery (0x0c), and Serial (0x10)...';
     render();
-    if (cmds.reqFirmware) await writeHex(cmds.reqFirmware, 200);
-    if (cmds.reqBattery) await writeHex(cmds.reqBattery, 200);
-    if (cmds.reqSerial) await writeHex(cmds.reqSerial, 200);
+    await writeHex(cmds.reqFirmware || '0803000000', 200);
+    await writeHex(cmds.reqBattery || '0c00', 200);
+    await writeHex(cmds.reqSerial || '1803080010', 200);
 
     // 2. Authenticate via AES-128-ECB Nonce Challenge (0x2f 0x01 0x2b -> 0x2f 0x11 0x2d)
     state.bleStatus = 'Requesting 15-byte Auth Nonce (0x2f 0x01 0x2b)...';
@@ -2384,27 +2608,42 @@ async function runWebBluetoothRingSync({ pairNewKey = false } = {}) {
       await writeHex(solved.authPacketHex, 450);
     }
 
-    // 3. Sync Ring Clock, Enable Daytime HR / SpO2 / Resting HR, Trigger Sleep Analysis
-    state.bleStatus = 'Syncing ring clock (0x12), enabling HR/SpO2 sensors (0x26), and triggering sleep analysis (0x42)...';
+    // 3. Sync Ring Clock to Device Local Timezone, Enable Daytime HR / SpO2 / Resting HR, Trigger Sleep Analysis
+    state.bleStatus = `Syncing ring clock to device time (${getDeviceTimezoneLabel()}), enabling HR/SpO2 (0x26), and triggering sleep analysis (0x28)...`;
     render();
-    if (cmds.reqSyncTime) await writeHex(cmds.reqSyncTime, 200);
-    if (cmds.enableDaytimeHr) await writeHex(cmds.enableDaytimeHr, 150);
-    if (cmds.enableExerciseHr) await writeHex(cmds.enableExerciseHr, 150);
-    if (cmds.enableSpo2) await writeHex(cmds.enableSpo2, 150);
-    if (cmds.enableRestingHr) await writeHex(cmds.enableRestingHr, 150);
-    if (cmds.reqCheckSleepAnalysis) await writeHex(cmds.reqCheckSleepAnalysis, 500);
+    await writeHex(buildLiveSyncTimeHex(), 250);
+    await writeHex(cmds.enableDaytimeHr || '2f03220201', 150);
+    await writeHex(cmds.enableExerciseHr || '2f03220301', 150);
+    await writeHex(cmds.enableSpo2 || '2f03220401', 150);
+    await writeHex(cmds.enableRestingHr || '2f03220801', 150);
+    await writeHex(cmds.reqCheckSleepAnalysis || '280101', 600);
 
-    // 4. Drain History Events from cursor
-    state.bleStatus = 'Draining binary history events (0x10 0x09)...';
-    render();
-    if (cmds.reqGetEventFromCursor) {
-      await writeHex(cmds.reqGetEventFromCursor, 1800);
+    // 4. Drain History Events in batches until the ring finishes streaming
+    let cursorDs = 0;
+    for (let batch = 0; batch < 12; batch++) {
+      batchEventCount = 0;
+      state.bleStatus = `Draining binary history events (batch ${batch + 1}, cursor=${cursorDs} ds, ${collectedNotificationsHex.length} frames)...`;
+      render();
+      await writeChar.writeValue(hexToUint8(buildGetEventHex(cursorDs, 0)));
+
+      // Wait until notifications settle for 650ms (up to 4s per batch)
+      const batchStart = Date.now();
+      while (Date.now() - batchStart < 4000) {
+        await new Promise((r) => setTimeout(r, 220));
+        if (Date.now() - batchStart > 700 && Date.now() - lastEventRxAt > 650) {
+          break;
+        }
+      }
+      if (batchEventCount === 0 || maxSeenRingTs <= cursorDs) {
+        break;
+      }
+      cursorDs = maxSeenRingTs + 1;
     }
 
     device.gatt.disconnect();
 
-    // 5. Ingest collected binary packets on the server
-    state.bleStatus = `Uploading ${collectedNotificationsHex.length} BLE frames to local open_oura decoder...`;
+    // 5. Ingest collected binary packets (and clear unsynced demo days)
+    state.bleStatus = `Decoding ${collectedNotificationsHex.length} BLE frames in local device time...`;
     render();
     const res = await api('/api/ring/ingest', {
       method: 'POST',
@@ -2415,8 +2654,9 @@ async function runWebBluetoothRingSync({ pairNewKey = false } = {}) {
       })
     });
 
-    state.bleStatus = `Synced ${res.eventsIngested} events (${res.daysUpdated} days updated)!`;
-    showToast(`BLE Ring Sync complete: ${res.eventsIngested} packets decoded!`);
+    state.bleStatus = res.message || `Synced ${res.eventsIngested} events (${res.daysUpdated} day(s) updated)!`;
+    showToast(res.message || `BLE Ring Sync complete: ${res.eventsIngested} packets decoded!`);
+    state.selectedDay = null;
     await loadCurrentTabData();
   } catch (err) {
     state.bleStatus = `BLE Sync note: ${err.message}`;

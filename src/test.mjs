@@ -164,6 +164,25 @@ async function runTests() {
     assert.ok(bleSyncData.eventsIngested >= 120);
     assert.ok(bleSyncData.daysSynced >= 7);
 
+    // Verify bedtimeStart is anchored to local device evening time (not 4 PM / UTC offset bug)
+    const syncedDailyRes = await fetch(`${baseUrl}/api/dashboard/daily`, {
+      headers: { Cookie: cookie }
+    });
+    const syncedDaily = await syncedDailyRes.json();
+    const bedLocalHour = new Date(syncedDaily.summary.sleep.bedtimeStart).getHours();
+    assert.ok(
+      bedLocalHour >= 20 || bedLocalHour <= 2,
+      `Expected bedtime in local evening hours (20..02), got local hour ${bedLocalHour}`
+    );
+
+    // Verify unsynced date returns summary: null and empty heartrate (no fallback to latestDay)
+    const unsyncedRes = await fetch(`${baseUrl}/api/dashboard/daily?day=2020-01-01`, {
+      headers: { Cookie: cookie }
+    });
+    const unsyncedData = await unsyncedRes.json();
+    assert.equal(unsyncedData.summary, null);
+    assert.equal(unsyncedData.heartrate.length, 0);
+
     // 12. Verify `/api/ring/overview` returns decoded binary event counts
     const ovRes = await fetch(`${baseUrl}/api/ring/overview`, {
       headers: { Cookie: cookie }

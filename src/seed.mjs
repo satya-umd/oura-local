@@ -8,7 +8,8 @@ import {
   addSyncLog,
   setUserSyncState,
   getSetting,
-  setSetting
+  setSetting,
+  toLocalDayStr
 } from './db.mjs';
 import { hashPassword } from './security.mjs';
 
@@ -63,10 +64,11 @@ function generateHypnogramAndCurves(totalBuckets, baseHr, baseHrv, rand) {
 
 function generateIntradayHrSamples(dayStr, baseRhr, hasWorkout, rand) {
   const samples = [];
+  const [y, m, d] = dayStr.split('-').map(Number);
   for (let mins = 0; mins < 1440; mins += 15) {
-    const hh = String(Math.floor(mins / 60)).padStart(2, '0');
-    const mm = String(mins % 60).padStart(2, '0');
-    const timestamp = `${dayStr}T${hh}:${mm}:00Z`;
+    const hh = Math.floor(mins / 60);
+    const mm = mins % 60;
+    const timestamp = new Date(y, m - 1, d, hh, mm, 0).toISOString();
     const hour = mins / 60;
 
     let bpm = baseRhr + 16;
@@ -165,12 +167,10 @@ export function seedDemoHousehold({ days = 90, force = false } = {}) {
     const rand = seededRandom(prof.seed);
 
     for (let offset = days - 1; offset >= 0; offset--) {
-      const d = new Date(today);
-      d.setDate(today.getDate() - offset);
-      const dayStr = d.toISOString().slice(0, 10);
-      const prevDay = new Date(d);
-      prevDay.setDate(d.getDate() - 1);
-      const prevDayStr = prevDay.toISOString().slice(0, 10);
+      const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - offset, 12, 0, 0);
+      const dayStr = toLocalDayStr(d);
+      const prevDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() - 1, 12, 0, 0);
+      const prevDayStr = toLocalDayStr(prevDay);
 
       const dayOfWeek = d.getDay();
       const isWeekend = dayOfWeek === 5 || dayOfWeek === 6;
@@ -249,9 +249,9 @@ export function seedDemoHousehold({ days = 90, force = false } = {}) {
       );
       const averageBreath = Number((14.2 + (rand() - 0.5) * 1.4).toFixed(1));
 
-      // Compute Bedtime Start and End ISO strings
-      const bedDate = new Date(`${prevDayStr}T00:00:00`);
-      bedDate.setMinutes(Math.round(bedtimeHour * 60));
+      // Compute Bedtime Start and End ISO strings in local device clock time
+      const [py, pm, pd] = prevDayStr.split('-').map(Number);
+      const bedDate = new Date(py, pm - 1, pd, 0, Math.round(bedtimeHour * 60), 0);
       const wakeDate = new Date(bedDate.getTime() + timeInBedSeconds * 1000);
 
       const totalBuckets = Math.max(40, Math.round(timeInBedSeconds / 300));
@@ -373,14 +373,15 @@ export function seedDemoHousehold({ days = 90, force = false } = {}) {
       if (hasWorkout) {
         const activities = ['Running', 'Strength Training', 'Cycling', 'Yoga & Mobility', 'Hiking'];
         const act = activities[Math.floor(rand() * activities.length)];
+        const [wy, wm, wd] = dayStr.split('-').map(Number);
         upsertWorkout(prof.id, {
           id: `demo-workout-${prof.id}-${dayStr}`,
           day: dayStr,
           activity: act,
           calories: Math.round(220 + rand() * 260),
           distance: act === 'Running' || act === 'Cycling' || act === 'Hiking' ? Math.round(3500 + rand() * 5000) : 0,
-          start_datetime: `${dayStr}T17:15:00Z`,
-          end_datetime: `${dayStr}T18:05:00Z`,
+          start_datetime: new Date(wy, wm - 1, wd, 17, 15, 0).toISOString(),
+          end_datetime: new Date(wy, wm - 1, wd, 18, 5, 0).toISOString(),
           intensity: rand() > 0.4 ? 'moderate' : 'high'
         });
       }

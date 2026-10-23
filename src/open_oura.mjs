@@ -11,7 +11,9 @@ import {
   getRingEventsForUser,
   upsertDailySummary,
   replaceHeartrateDay,
-  getUserBaselines
+  getUserBaselines,
+  toLocalDayStr,
+  clearUserSummariesForRealSync
 } from './db.mjs';
 
 /**
@@ -130,7 +132,10 @@ export function reqSetAuthKey(key16) {
   return encodePacket(0x24, [...keyBuf]);
 }
 
-export function reqSyncTime(unixSecs = Math.floor(Date.now() / 1000), tzHalfHours = 0) {
+export function reqSyncTime(
+  unixSecs = Math.floor(Date.now() / 1000),
+  tzHalfHours = Math.round(-new Date().getTimezoneOffset() / 30)
+) {
   const payload = Buffer.alloc(9);
   payload.writeBigUInt64LE(BigInt(unixSecs), 0);
   payload[8] = tzHalfHours & 0xff;
@@ -743,17 +748,32 @@ export function scoreRingDay({
  * drops by more than `resetDropDs` (36000 ds = 1 hour), and anchors each epoch's
  * `bootUnix` to UTC seconds.
  */
-export function buildRingEpochs(events, resetDropDs = 36000) {
+export function buildRingEpochs(events, resetDropDs = 432000) {
   if (!events || events.length === 0) return [];
   const epochs = [];
   let curStartIdx = 0;
   let maxRingTs = Number(events[0].ringTimestamp || 0);
   let lastCapUnix = Number(events[0].capturedUnix || Math.floor(Date.now() / 1000));
+  let anchorBootUnix = null;
+
+  const checkTimeAnchor = (ev) => {
+    let dec = ev.decoded;
+    if (!dec && ev.decodedJson) {
+      try {
+        dec = JSON.parse(ev.decodedJson);
+      } catch {}
+    }
+    if (dec && Number.isFinite(dec.unix_time) && dec.unix_time > 1577836800) {
+      anchorBootUnix = dec.unix_time - Number(ev.ringTimestamp || 0) / 10.0;
+    }
+  };
+
+  checkTimeAnchor(events[0]);
 
   for (let i = 1; i < events.length; i++) {
     const rts = Number(events[i].ringTimestamp || 0);
     if (maxRingTs > rts && maxRingTs - rts > resetDropDs) {
-      const bootUnix = lastCapUnix - maxRingTs / 10.0;
+      const bootUnix = anchorBootUnix !== null ? anchorBootUnix : lastCapUnix - maxRingTs / 10.0;
       epochs.push({
         startIdx: curStartIdx,
         endIdx: i - 1,
@@ -761,16 +781,18 @@ export function buildRingEpochs(events, resetDropDs = 36000) {
       });
       curStartIdx = i;
       maxRingTs = rts;
+      anchorBootUnix = null;
     } else if (rts > maxRingTs) {
       maxRingTs = rts;
     }
+    checkTimeAnchor(events[i]);
     lastCapUnix = Number(events[i].capturedUnix || lastCapUnix);
   }
 
   epochs.push({
     startIdx: curStartIdx,
     endIdx: events.length - 1,
-    bootUnix: lastCapUnix - maxRingTs / 10.0
+    bootUnix: anchorBootUnix !== null ? anchorBootUnix : lastCapUnix - maxRingTs / 10.0
   });
 
   return epochs;
@@ -808,10 +830,15 @@ export function resolveEventsWithUnixTime(events) {
   });
 }
 
+function localDayDate(dayStr, hours = 0, minutes = 0, seconds = 0) {
+  const [y, m, d] = String(dayStr).split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1, hours, minutes, seconds, 0);
+}
+
 function unixToDayStr(unixSec) {
-  // Shift by 4 hours so sleep starting at 22:00–23:59 attributes to the waking day
+  // Shift by 4 hours so sleep starting at 20:00–23:59 local device time attributes to the waking day
   const d = new Date((unixSec + 4 * 3600) * 1000);
-  return d.toISOString().slice(0, 10);
+  return toLocalDayStr(d);
 }
 
 /**
@@ -829,8 +856,11 @@ export function aggregateRingEventsToSummaries(userId) {
     if (!byDay.has(day)) {
       byDay.set(day, {
         day,
+        hasData: false,
         bedtimeStartUnix: null,
         bedtimeEndUnix: null,
+        sleepMinUnix: null,
+        sleepMaxUnix: null,
         totalSleepSec: 0,
         deepSec: 0,
         remSec: 0,
@@ -855,30 +885,69 @@ export function aggregateRingEventsToSummaries(userId) {
     return byDay.get(day);
   };
 
+  const trackSleepWindow = (bucket, unixSec) => {
+    if (!Number.isFinite(unixSec)) return;
+    bucket.sleepMinUnix = bucket.sleepMinUnix !== null ? Math.min(bucket.sleepMinUnix, unixSec) : unixSec;
+    bucket.sleepMaxUnix = bucket.sleepMaxUnix !== null ? Math.max(bucket.sleepMaxUnix, unixSec) : unixSec;
+  };
+
   for (const ev of resolved) {
     const d = ev.decoded;
     if (!d) continue;
     const day = unixToDayStr(ev.unixSec);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
-    const bucket = ensureDay(day);
+    const evType = d.type || ev.name || eventName(ev.tag);
 
-    switch (d.type) {
+    switch (evType) {
       case 'bedtime_period': {
-        const startU = d.bedtimeStartDs ? Math.round(ev.unixSec - (ev.ringTimestamp - d.bedtimeStartDs) / 10.0) : ev.unixSec - 28000;
-        const endU = d.bedtimeEndDs ? Math.round(ev.unixSec - (ev.ringTimestamp - d.bedtimeEndDs) / 10.0) : ev.unixSec;
-        bucket.bedtimeStartUnix = bucket.bedtimeStartUnix ? Math.min(bucket.bedtimeStartUnix, startU) : startU;
-        bucket.bedtimeEndUnix = bucket.bedtimeEndUnix ? Math.max(bucket.bedtimeEndUnix, endU) : endU;
+        const bucket = ensureDay(day);
+        bucket.hasData = true;
+        const startDs = d.bedtime_start_ds ?? d.bedtimeStartDs;
+        const endDs = d.bedtime_end_ds ?? d.bedtimeEndDs;
+        const startU =
+          startDs !== undefined
+            ? Math.round(ev.unixSec - (ev.ringTimestamp - startDs) / 10.0)
+            : ev.unixSec - 28000;
+        const endU =
+          endDs !== undefined
+            ? Math.round(ev.unixSec - (ev.ringTimestamp - endDs) / 10.0)
+            : ev.unixSec;
+        if (endU >= startU && endU - startU <= 54000) {
+          bucket.bedtimeStartUnix = bucket.bedtimeStartUnix ? Math.min(bucket.bedtimeStartUnix, startU) : startU;
+          bucket.bedtimeEndUnix = bucket.bedtimeEndUnix ? Math.max(bucket.bedtimeEndUnix, endU) : endU;
+        }
         break;
       }
+      case 'sleep_phase_information':
+      case 'sleep_phase_details':
       case 'sleep_phase_data': {
-        bucket.totalSleepSec += Number(d.totalSleepSec || 0);
-        bucket.deepSec += Number(d.deepSec || 0);
-        bucket.remSec += Number(d.remSec || 0);
-        bucket.lightSec += Number(d.lightSec || 0);
-        bucket.awakeSec += Number(d.awakeSec || 0);
-        if (Array.isArray(d.samples)) {
+        const bucket = ensureDay(day);
+        bucket.hasData = true;
+        trackSleepWindow(bucket, ev.unixSec);
+        if (d.totalSleepSec || d.deepSec || d.remSec || d.lightSec) {
+          bucket.totalSleepSec += Number(d.totalSleepSec || 0);
+          bucket.deepSec += Number(d.deepSec || 0);
+          bucket.remSec += Number(d.remSec || 0);
+          bucket.lightSec += Number(d.lightSec || 0);
+          bucket.awakeSec += Number(d.awakeSec || 0);
+        }
+        if (Array.isArray(d.phases)) {
+          const mapPhase = { deep: '1', light: '2', rem: '3', awake: '4' };
+          for (const p of d.phases) {
+            const ch = mapPhase[p] || '2';
+            bucket.hypnogramChars.push(ch);
+            if (!d.totalSleepSec) {
+              if (ch === '1') bucket.deepSec += 300;
+              else if (ch === '3') bucket.remSec += 300;
+              else if (ch === '4') bucket.awakeSec += 300;
+              else bucket.lightSec += 300;
+            }
+          }
+          if (!d.totalSleepSec) {
+            bucket.totalSleepSec = bucket.deepSec + bucket.remSec + bucket.lightSec;
+          }
+        } else if (Array.isArray(d.samples)) {
           for (const s of d.samples) {
-            // Map 1=deep, 2=light, 3=rem, 4=awake
             const stage = s >= 1 && s <= 4 ? String(s) : '2';
             bucket.hypnogramChars.push(stage);
           }
@@ -886,29 +955,53 @@ export function aggregateRingEventsToSummaries(userId) {
         break;
       }
       case 'sleep_period_information_2': {
-        if (d.averageHrBpm >= 35 && d.averageHrBpm <= 130) {
-          bucket.hr5min.push(Math.round(d.averageHrBpm));
+        const bucket = ensureDay(day);
+        bucket.hasData = true;
+        trackSleepWindow(bucket, ev.unixSec);
+        const hrVal = d.average_hr ?? d.averageHrBpm;
+        if (hrVal >= 35 && hrVal <= 130) {
+          bucket.hr5min.push(Math.round(hrVal));
           bucket.hrSamples.push({
             timestamp: new Date(ev.unixSec * 1000).toISOString(),
-            bpm: Math.round(d.averageHrBpm),
+            bpm: Math.round(hrVal),
             source: 'sleep'
           });
         }
-        if (d.breathRate >= 8 && d.breathRate <= 30) {
-          bucket.breathSamples.push(d.breathRate);
+        const brVal = d.breath ?? d.breathRate;
+        if (brVal >= 8 && brVal <= 30) {
+          bucket.breathSamples.push(Number(brVal));
         }
-        if (d.sleepState >= 0 && d.sleepState <= 4) {
+        const slState = d.sleep_state ?? d.sleepState;
+        if (slState >= 0 && slState <= 4) {
           const mapStage = { 0: '4', 1: '2', 2: '1', 3: '3', 4: '4' };
-          bucket.hypnogramChars.push(mapStage[d.sleepState] || '2');
+          bucket.hypnogramChars.push(mapStage[slState] || '2');
         }
         break;
       }
       case 'hrv_event': {
-        const rmssd = d.averageRmssd5min || d.rmssd || 0;
-        if (rmssd >= 10 && rmssd <= 250) {
-          bucket.hrv5min.push(Math.round(rmssd));
+        const bucket = ensureDay(day);
+        bucket.hasData = true;
+        trackSleepWindow(bucket, ev.unixSec);
+        if (Array.isArray(d.rmssd_ms)) {
+          for (const r of d.rmssd_ms) {
+            if (r >= 10 && r <= 250) bucket.hrv5min.push(Math.round(r));
+          }
+        } else {
+          const rmssd = d.averageRmssd5min || d.rmssd || 0;
+          if (rmssd >= 10 && rmssd <= 250) bucket.hrv5min.push(Math.round(rmssd));
         }
-        if (d.averageHr5min >= 35 && d.averageHr5min <= 140) {
+        if (Array.isArray(d.hr_bpm)) {
+          d.hr_bpm.forEach((hr, idx) => {
+            if (hr >= 35 && hr <= 140) {
+              bucket.hr5min.push(Math.round(hr));
+              bucket.hrSamples.push({
+                timestamp: new Date((ev.unixSec + idx * 300) * 1000).toISOString(),
+                bpm: Math.round(hr),
+                source: 'sleep'
+              });
+            }
+          });
+        } else if (d.averageHr5min >= 35 && d.averageHr5min <= 140) {
           bucket.hr5min.push(Math.round(d.averageHr5min));
           bucket.hrSamples.push({
             timestamp: new Date(ev.unixSec * 1000).toISOString(),
@@ -920,11 +1013,25 @@ export function aggregateRingEventsToSummaries(userId) {
       }
       case 'ibi_and_amplitude_event':
       case 'green_ibi_quality_event': {
-        if (d.hrBpm >= 35 && d.hrBpm <= 195) {
+        const bucket = ensureDay(day);
+        bucket.hasData = true;
+        const src = evType === 'green_ibi_quality_event' ? 'daytime' : 'sleep';
+        if (src === 'sleep') trackSleepWindow(bucket, ev.unixSec);
+        if (Array.isArray(d.hr_bpm)) {
+          for (const hr of d.hr_bpm) {
+            if (hr >= 35 && hr <= 195) {
+              bucket.hrSamples.push({
+                timestamp: new Date(ev.unixSec * 1000).toISOString(),
+                bpm: Math.round(hr),
+                source: src
+              });
+            }
+          }
+        } else if (d.hrBpm >= 35 && d.hrBpm <= 195) {
           bucket.hrSamples.push({
             timestamp: new Date(ev.unixSec * 1000).toISOString(),
             bpm: Math.round(d.hrBpm),
-            source: d.type === 'green_ibi_quality_event' ? 'daytime' : 'sleep'
+            source: src
           });
         }
         if (d.rmssdApprox >= 10 && d.rmssdApprox <= 250) {
@@ -933,30 +1040,64 @@ export function aggregateRingEventsToSummaries(userId) {
         break;
       }
       case 'sleep_temp_event':
+      case 'temp_period':
       case 'temp_event': {
-        const c = Number(d.tempC || 0);
-        if (c >= 30.0 && c <= 41.0) {
-          bucket.tempCentiSamples.push(Math.round(c * 100));
+        const bucket = ensureDay(day);
+        bucket.hasData = true;
+        if (evType === 'sleep_temp_event') trackSleepWindow(bucket, ev.unixSec);
+        if (Array.isArray(d.temps_c)) {
+          for (const c of d.temps_c) {
+            if (c >= 30.0 && c <= 41.0) bucket.tempCentiSamples.push(Math.round(c * 100));
+          }
+        } else {
+          const c = Number(d.tempC || 0);
+          if (c >= 30.0 && c <= 41.0) bucket.tempCentiSamples.push(Math.round(c * 100));
         }
         break;
       }
       case 'spo2_event':
       case 'spo2_r_pi_event': {
-        const pct = Number(d.spo2Avg || 0);
-        if (pct >= 80 && pct <= 100) {
-          bucket.spo2Samples.push(pct);
+        const bucket = ensureDay(day);
+        bucket.hasData = true;
+        if (Array.isArray(d.spo2_percent)) {
+          for (const pct of d.spo2_percent) {
+            if (pct >= 80 && pct <= 100) bucket.spo2Samples.push(pct);
+          }
+        } else if (Array.isArray(d.r)) {
+          for (const rv of d.r) {
+            const pct = spo2Simple(rv);
+            if (pct >= 80 && pct <= 100) bucket.spo2Samples.push(pct);
+          }
+        } else {
+          const pct = Number(d.spo2Avg || 0);
+          if (pct >= 80 && pct <= 100) bucket.spo2Samples.push(pct);
         }
         break;
       }
       case 'activity_information': {
-        const st = Number(d.steps || 0);
-        if (st > bucket.stepsMax) bucket.stepsMax = st;
-        bucket.stepsSum += st;
-        bucket.activeCalSum += Number(d.activeCalories || 0);
-        if (st > 90) bucket.highActivitySec += 300;
-        else if (st > 35) bucket.medActivitySec += 300;
-        else if (st > 5) bucket.lowActivitySec += 300;
-        else bucket.sedentarySec += 300;
+        const bucket = ensureDay(day);
+        bucket.hasData = true;
+        if (Array.isArray(d.met) && d.met.length > 0) {
+          for (const m of d.met) {
+            const estSteps = m > 1.3 ? Math.round((m - 1.0) * 45) : 0;
+            const estCal = m > 1.2 ? Math.round((m - 1.0) * 1.4) : 0;
+            bucket.stepsSum += estSteps;
+            bucket.activeCalSum += estCal;
+            if (m >= 6.0) bucket.highActivitySec += 60;
+            else if (m >= 3.0) bucket.medActivitySec += 60;
+            else if (m >= 1.5) bucket.lowActivitySec += 60;
+            else bucket.sedentarySec += 60;
+          }
+        } else {
+          const st = Number(d.steps || 0);
+          if (st > bucket.stepsMax) bucket.stepsMax = st;
+          bucket.stepsSum += st;
+          bucket.activeCalSum += Number(d.activeCalories || 0);
+          if (st > 90) bucket.highActivitySec += 300;
+          else if (st > 35) bucket.medActivitySec += 300;
+          else if (st > 5) bucket.lowActivitySec += 300;
+          else bucket.sedentarySec += 300;
+        }
         break;
       }
       default:
@@ -965,7 +1106,7 @@ export function aggregateRingEventsToSummaries(userId) {
   }
 
   // Sort days chronologically and compute daily summaries + scores
-  const sortedDays = [...byDay.keys()].sort();
+  const sortedDays = [...byDay.keys()].filter((day) => byDay.get(day).hasData).sort();
   const nightlyTempsByDay = new Map();
   for (const day of sortedDays) {
     const b = byDay.get(day);
@@ -984,7 +1125,7 @@ export function aggregateRingEventsToSummaries(userId) {
     const b = byDay.get(day);
     const baseline = getUserBaselines(userId, day, 14);
 
-    // Derive sleep durations if only hypnogram or bedtime was captured
+    // Derive sleep durations if hypnogram or bedtime was captured
     let totalSleepSec = b.totalSleepSec;
     let deepSec = b.deepSec;
     let remSec = b.remSec;
@@ -1010,23 +1151,24 @@ export function aggregateRingEventsToSummaries(userId) {
       lightSec = totalSleepSec - deepSec - remSec;
     }
 
-    const lowestHr = b.hr5min.length > 0 ? Math.min(...b.hr5min) : baseline.lowestHr;
+    const hasSleepData = totalSleepSec > 0 || b.hypnogramChars.length > 0;
+    const lowestHr = b.hr5min.length > 0 ? Math.min(...b.hr5min) : null;
     const averageHr =
       b.hr5min.length > 0
         ? Number((b.hr5min.reduce((a, v) => a + v, 0) / b.hr5min.length).toFixed(1))
-        : lowestHr + 5.2;
+        : null;
     const averageHrv =
       b.hrv5min.length > 0
         ? Math.round(b.hrv5min.reduce((a, v) => a + v, 0) / b.hrv5min.length)
-        : baseline.averageHrv;
+        : null;
     const averageBreath =
       b.breathSamples.length > 0
         ? Number((b.breathSamples.reduce((a, v) => a + v, 0) / b.breathSamples.length).toFixed(1))
-        : 14.6;
+        : null;
 
     // Temperature deviation vs trailing mean
     const curTempC = nightlyTempsByDay.get(day);
-    let tempDeviation = 0.0;
+    let tempDeviation = null;
     if (curTempC !== undefined) {
       const prevTemps = [...nightlyTempsByDay.entries()]
         .filter(([k]) => k < day)
@@ -1040,7 +1182,7 @@ export function aggregateRingEventsToSummaries(userId) {
     const steps = Math.max(b.stepsMax, b.stepsSum);
     const activeCalories = b.activeCalSum || Math.round(steps * 0.042);
     const bmrCal = Math.round(bmrSchofield(34, 2, 70));
-    const totalCalories = bmrCal + activeCalories;
+    const totalCalories = steps > 0 || activeCalories > 0 ? bmrCal + activeCalories : 0;
 
     const spo2Percentage =
       b.spo2Samples.length > 0
@@ -1048,66 +1190,80 @@ export function aggregateRingEventsToSummaries(userId) {
         : null;
 
     const scored = scoreRingDay({
-      totalSleepSec: totalSleepSec || 26400,
-      deepSec: deepSec || 5400,
-      remSec: remSec || 6000,
-      lightSec: lightSec || 15000,
-      awakeSec: awakeSec || 2400,
-      latencySec: 780,
-      lowestHr,
-      averageHrv,
-      tempDeviationC: tempDeviation,
-      steps: steps || 7800,
+      totalSleepSec,
+      deepSec,
+      remSec,
+      lightSec,
+      awakeSec,
+      latencySec: hasSleepData ? 720 : 0,
+      lowestHr: lowestHr ?? baseline.lowestHr,
+      averageHrv: averageHrv ?? baseline.averageHrv,
+      tempDeviationC: tempDeviation ?? 0,
+      steps,
       activeCalories,
       baselineHrv: baseline.averageHrv,
       baselineRhr: baseline.lowestHr,
       baselineSleepSec: baseline.totalSleepSeconds
     });
 
-    const bedtimeStartIso = b.bedtimeStartUnix
-      ? new Date(b.bedtimeStartUnix * 1000).toISOString()
-      : `${day}T22:45:00.000Z`;
-    const bedtimeEndIso = b.bedtimeEndUnix
-      ? new Date(b.bedtimeEndUnix * 1000).toISOString()
-      : `${day}T06:45:00.000Z`;
+    const timeInBedSec = totalSleepSec + awakeSec;
+
+    // Resolve bedtimeStart & bedtimeEnd in local device clock time (never hardcoded UTC Z!)
+    let bedtimeStartIso = null;
+    let bedtimeEndIso = null;
+    if (b.bedtimeStartUnix && b.bedtimeEndUnix && b.bedtimeEndUnix > b.bedtimeStartUnix) {
+      bedtimeStartIso = new Date(b.bedtimeStartUnix * 1000).toISOString();
+      bedtimeEndIso = new Date(b.bedtimeEndUnix * 1000).toISOString();
+    } else if (hasSleepData && b.sleepMinUnix && b.sleepMaxUnix) {
+      const endU = b.sleepMaxUnix;
+      const startU = Math.min(b.sleepMinUnix, endU - Math.max(timeInBedSec, 3600));
+      bedtimeStartIso = new Date(startU * 1000).toISOString();
+      bedtimeEndIso = new Date(endU * 1000).toISOString();
+    } else if (hasSleepData) {
+      // Anchor fallback to local device time (e.g. wake 6:45 AM local time, bedtime = wake - timeInBed)
+      const localWake = localDayDate(day, 6, 45, 0);
+      const localBed = new Date(localWake.getTime() - Math.max(timeInBedSec, 25200) * 1000);
+      bedtimeStartIso = localBed.toISOString();
+      bedtimeEndIso = localWake.toISOString();
+    }
 
     const patch = {
-      readiness_score: scored.readinessScore,
+      readiness_score: hasSleepData || lowestHr !== null || averageHrv !== null ? scored.readinessScore : 0,
       temp_deviation: tempDeviation,
       temp_trend_deviation: tempDeviation,
-      hrv_balance_contrib: scored.contributors.hrvBalance,
-      resting_hr_contrib: scored.contributors.restingHeartRate,
-      recovery_index_contrib: scored.contributors.recoveryIndex,
-      sleep_balance_contrib: scored.contributors.sleepBalance,
-      previous_night_contrib: scored.contributors.previousNight,
-      activity_balance_contrib: scored.contributors.activityBalance,
-      sleep_score: scored.sleepScore,
-      total_sleep_seconds: totalSleepSec || 26400,
-      deep_sleep_seconds: deepSec || 5400,
-      rem_sleep_seconds: remSec || 6000,
-      light_sleep_seconds: lightSec || 15000,
-      awake_seconds: awakeSec || 2400,
-      time_in_bed_seconds: (totalSleepSec || 26400) + (awakeSec || 2400),
-      sleep_efficiency: scored.efficiency,
-      sleep_latency_seconds: 780,
+      hrv_balance_contrib: hasSleepData || averageHrv !== null ? scored.contributors.hrvBalance : 0,
+      resting_hr_contrib: hasSleepData || lowestHr !== null ? scored.contributors.restingHeartRate : 0,
+      recovery_index_contrib: hasSleepData ? scored.contributors.recoveryIndex : 0,
+      sleep_balance_contrib: hasSleepData ? scored.contributors.sleepBalance : 0,
+      previous_night_contrib: hasSleepData ? scored.sleepScore : 0,
+      activity_balance_contrib: steps > 0 ? scored.contributors.activityBalance : 0,
+      sleep_score: hasSleepData ? scored.sleepScore : 0,
+      total_sleep_seconds: totalSleepSec,
+      deep_sleep_seconds: deepSec,
+      rem_sleep_seconds: remSec,
+      light_sleep_seconds: lightSec,
+      awake_seconds: awakeSec,
+      time_in_bed_seconds: timeInBedSec,
+      sleep_efficiency: hasSleepData ? scored.efficiency : 0,
+      sleep_latency_seconds: hasSleepData ? 720 : 0,
       lowest_hr: lowestHr,
       average_hr: averageHr,
       average_hrv: averageHrv,
       average_breath: averageBreath,
       bedtime_start: bedtimeStartIso,
       bedtime_end: bedtimeEndIso,
-      hypnogram_5min: b.hypnogramChars.length > 0 ? b.hypnogramChars.join('') : '42211233221123324',
-      hr_5min_json: b.hr5min.length > 0 ? b.hr5min : [lowestHr + 4, lowestHr + 2, lowestHr, lowestHr + 3],
-      hrv_5min_json: b.hrv5min.length > 0 ? b.hrv5min : [averageHrv - 4, averageHrv, averageHrv + 5],
-      activity_score: scored.activityScore,
-      steps: steps || 7800,
+      hypnogram_5min: b.hypnogramChars.length > 0 ? b.hypnogramChars.join('') : '',
+      hr_5min_json: b.hr5min,
+      hrv_5min_json: b.hrv5min,
+      activity_score: steps > 0 || activeCalories > 0 ? scored.activityScore : 0,
+      steps,
       active_calories: activeCalories,
       total_calories: totalCalories,
-      equivalent_walking_distance: stepsToMeters(steps || 7800),
-      high_activity_seconds: b.highActivitySec || 900,
-      medium_activity_seconds: b.medActivitySec || 2400,
-      low_activity_seconds: b.lowActivitySec || 12600,
-      sedentary_seconds: b.sedentarySec || 28800,
+      equivalent_walking_distance: stepsToMeters(steps),
+      high_activity_seconds: b.highActivitySec,
+      medium_activity_seconds: b.medActivitySec,
+      low_activity_seconds: b.lowActivitySec,
+      sedentary_seconds: b.sedentarySec,
       inactivity_alerts: 0
     };
 
@@ -1135,8 +1291,16 @@ export function aggregateRingEventsToSummaries(userId) {
  */
 export function ingestBleNotifications(
   userId,
-  { serial = `OURA3-${userId}`, notificationsHex = [], phoneUnix = Math.floor(Date.now() / 1000) }
+  {
+    serial = `OURA3-${userId}`,
+    notificationsHex = [],
+    phoneUnix = Math.floor(Date.now() / 1000),
+    clearDemo = false
+  }
 ) {
+  if (clearDemo) {
+    clearUserSummariesForRealSync(userId);
+  }
   let maxRingTs = 0;
   let eventsIngested = 0;
   let batteryPercent = null;
@@ -1305,7 +1469,8 @@ export function importOpenOuraSqliteBuffer(userId, sqliteBuffer) {
  * full binary-to-dashboard `open_oura` pipeline without needing Oura Cloud.
  */
 export function simulateOpenOuraBleDrain(userId, { daysBack = 7, serial = `OURA3-${userId}` } = {}) {
-  const nowUnix = Math.floor(Date.now() / 1000);
+  const now = new Date();
+  const nowUnix = Math.floor(now.getTime() / 1000);
   const bootUnix = nowUnix - (daysBack + 2) * 86400;
   const toRingDs = (u) => Math.max(100, Math.round((u - bootUnix) * 10));
 
@@ -1317,75 +1482,79 @@ export function simulateOpenOuraBleDrain(userId, { daysBack = 7, serial = `OURA3
   notificationsHex.push(encodePacket(0x0d, [88, 0]).toString('hex'));
 
   for (let d = daysBack - 1; d >= 0; d--) {
-    const dayMidUnix = nowUnix - d * 86400;
-    const bedStartUnix = dayMidUnix - 9 * 3600;
-    const bedEndUnix = dayMidUnix - 1 * 3600;
+    // Anchor bedtime to 10:45 PM local device clock time and wake to 6:45 AM local device clock time
+    const bedStartDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - d - 1, 22, 45 - (d % 3) * 10, 0);
+    const bedEndDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - d, 6, 45 + (d % 3) * 10, 0);
+    const bedStartUnix = Math.floor(bedStartDate.getTime() / 1000);
+    const bedEndUnix = Math.floor(bedEndDate.getTime() / 1000);
     const wakeDs = toRingDs(bedEndUnix);
 
-    // 0x75 sleep_temp_event (during sleep, increasing timestamps)
+    // 0x75 sleep_temp_event (during sleep, centi-Celsius int16LE)
     for (let b = 0; b < 8; b++) {
       const tempBuf = Buffer.alloc(4 + 8 * 2);
       tempBuf.writeUInt32LE(toRingDs(bedStartUnix + b * 1800), 0);
       for (let s = 0; s < 8; s++) {
-        tempBuf.writeUInt16LE(3620 + ((d * 7 + s) % 35), 4 + s * 2);
+        tempBuf.writeInt16LE(3620 + ((d * 7 + s) % 35), 4 + s * 2);
       }
       notificationsHex.push(encodePacket(0x75, tempBuf).toString('hex'));
     }
 
-    // 0x5d hrv_event samples across the second half of the night
+    // 0x5d hrv_event ([hr_bpm, rmssd_ms] pairs across the night)
     for (let h = 0; h < 6; h++) {
-      const hrvBuf = Buffer.alloc(10);
-      hrvBuf.writeUInt32LE(toRingDs(bedStartUnix + 4 * 3600 + h * 1800), 0);
-      const hrBpm = 50 + ((d + h) % 7);
-      const rmssd = 56 + ((d * 5 + h * 3) % 24);
-      hrvBuf.writeUInt16LE(rmssd, 4);
-      hrvBuf.writeUInt16LE(hrBpm, 6);
-      hrvBuf.writeUInt16LE(rmssd, 8);
+      const hrvBuf = Buffer.alloc(4 + 8);
+      hrvBuf.writeUInt32LE(toRingDs(bedStartUnix + 2 * 3600 + h * 1800), 0);
+      for (let p = 0; p < 4; p++) {
+        hrvBuf[4 + p * 2] = 50 + ((d + h + p) % 7);
+        hrvBuf[4 + p * 2 + 1] = 58 + ((d * 5 + h * 3 + p * 2) % 24);
+      }
       notificationsHex.push(encodePacket(0x5d, hrvBuf).toString('hex'));
     }
 
-    // 0x76 bedtime_period (at wake)
+    // 0x76 bedtime_period (at wake: [ts_ds, bedtime_start_ds, bedtime_end_ds])
     const bedPayload = Buffer.alloc(12);
     bedPayload.writeUInt32LE(wakeDs, 0);
     bedPayload.writeUInt32LE(toRingDs(bedStartUnix), 4);
     bedPayload.writeUInt32LE(wakeDs, 8);
     notificationsHex.push(encodePacket(0x76, bedPayload).toString('hex'));
 
-    // 0x5a sleep_phase_data (totalSleep, deep, rem, light, awake + hypnogram stages)
-    const deepSec = 5400 + ((d * 310) % 1800);
-    const remSec = 6000 + ((d * 270) % 1800);
-    const lightSec = 14400 + ((d * 410) % 2400);
-    const awakeSec = 1800 + ((d * 190) % 900);
-    const totalSleepSec = deepSec + remSec + lightSec;
-    const sleepBuf = Buffer.alloc(14 + 16);
+    // 0x5a sleep_phase_data (2-bit packed phases: 0=deep, 1=light, 2=rem, 3=awake)
+    // 24 bytes of packed phases = 96 5-min epochs (8 hours)
+    const phasePattern = [
+      3, 1, 1, 0, 0, 0, 1, 1, 2, 2, 1, 0,
+      0, 1, 1, 2, 2, 2, 1, 0, 1, 2, 2, 3
+    ];
+    const sleepBuf = Buffer.alloc(4 + 1 + 24);
     sleepBuf.writeUInt32LE(wakeDs + 10, 0);
-    sleepBuf.writeUInt16LE(totalSleepSec, 4);
-    sleepBuf.writeUInt16LE(deepSec, 6);
-    sleepBuf.writeUInt16LE(remSec, 8);
-    sleepBuf.writeUInt16LE(lightSec, 10);
-    sleepBuf.writeUInt16LE(awakeSec, 12);
-    const hypStages = [4, 2, 2, 1, 1, 2, 3, 3, 2, 1, 1, 2, 3, 3, 2, 4];
-    hypStages.forEach((st, idx) => sleepBuf.writeUInt8(st, 14 + idx));
+    sleepBuf[4] = 1; // header
+    for (let i = 0; i < 24; i++) {
+      const p0 = phasePattern[i % phasePattern.length];
+      const p1 = phasePattern[(i + 1) % phasePattern.length];
+      const p2 = phasePattern[(i + 2) % phasePattern.length];
+      const p3 = phasePattern[(i + 3) % phasePattern.length];
+      sleepBuf[5 + i] = ((p0 & 3) << 6) | ((p1 & 3) << 4) | ((p2 & 3) << 2) | (p3 & 3);
+    }
     notificationsHex.push(encodePacket(0x5a, sleepBuf).toString('hex'));
 
-    // 0x6f spo2_event
-    const spo2Buf = Buffer.alloc(12);
+    // 0x6f spo2_event ([header, ...spo2_percent, 0xff])
+    const spo2Buf = Buffer.from([0, 0, 0, 0, 1, 98, 98, 97, 99, 98, 0xff]);
     spo2Buf.writeUInt32LE(wakeDs + 20, 0);
-    spo2Buf.writeUInt8(98, 4);
-    spo2Buf.writeUInt8(96, 5);
-    spo2Buf.writeUInt32LE(bedEndUnix, 8);
     notificationsHex.push(encodePacket(0x6f, spo2Buf).toString('hex'));
 
-    // 0x50 activity_information (daytime after wake)
-    const actBuf = Buffer.alloc(12);
+    // 0x50 activity_information (MET bytes during daytime)
+    const actBuf = Buffer.alloc(4 + 1 + 60);
     actBuf.writeUInt32LE(wakeDs + 36000, 0);
-    const steps = 7800 + ((d * 970) % 4800);
-    const actCal = Math.round(steps * 0.045);
-    actBuf.writeUInt16LE(steps, 4);
-    actBuf.writeUInt16LE(actCal, 6);
-    actBuf.writeUInt16LE(Math.round(steps * 0.08), 8);
+    actBuf[4] = 1;
+    for (let m = 0; m < 60; m++) {
+      actBuf[5 + m] = 35 + ((d * 3 + m) % 25); // 3.5 to 6.0 MET active minutes
+    }
     notificationsHex.push(encodePacket(0x50, actBuf).toString('hex'));
   }
+
+  // Emit 0x42 time_sync event anchoring ringTimestamp to phoneUnix
+  const syncBuf = Buffer.alloc(8);
+  syncBuf.writeUInt32LE(toRingDs(nowUnix), 0);
+  syncBuf.writeUInt32LE(nowUnix, 4);
+  notificationsHex.push(encodePacket(0x42, syncBuf).toString('hex'));
 
   return ingestBleNotifications(userId, {
     serial,
