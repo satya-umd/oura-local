@@ -16,7 +16,10 @@ It can be hosted for free as a serverless static PWA on **GitHub Pages (`*.githu
   - Installs onto iPhone Home Screens (*Safari → Share → Add to Home Screen*) with a full-screen standalone UI and bottom tab navigation.
 - **Multi-Ring & Couple Recovery Sync (Up to 3 Household Users)**:
   - Separate password-protected household profiles with instant ring switching.
-  - **Couple Sync View**: Side-by-side Readiness, Sleep, Activity, Resting HR & HRV vs. each person's 30-day rolling baseline, **Bedtime & Sleep Schedule Overlap** timeline, shared recovery streaks, and a 14-day dual trajectory overlay.
+  - **Couple Sync View**: Side-by-side Readiness, Sleep, Activity, Resting HR & HRV vs. each person's 30-day rolling baseline, **Bedtime & Sleep Schedule Overlap** timeline, shared recovery streaks, cycle phase awareness, and a 14-day dual trajectory overlay.
+- **🌸 Menstrual Cycle Tracking & Oura-Style Cycle Insights**:
+  - Uses Oura Ring Gen 3's `0x75 sleep_temp_event` (`±0.01 °C` NTC temperature sensor) to plot the **60-day biphasic nightly skin temperature deviation curve** (cooler Follicular phase below `0.0 °C` vs. warmer progesterone-driven Luteal phase `+0.20 °C` to `+0.45 °C`).
+  - Automatic **3-over-6 biphasic thermal shift ovulation detection**, next period countdown, fertile window estimation, 28-day circular phase dial (**Menstrual**, **Follicular**, **Ovulation**, **Luteal**), Follicular vs. Luteal biometric comparison (`Temp Δ`, `Resting HR`, `Nighttime HRV`), and 1-click period flow, LH strip, & symptom logging.
 - **Deep Biometric Analytics**:
   - Readiness, Sleep, and Activity circular gauges with contributor breakdowns.
   - Lowest Resting Heart Rate, Nighttime HRV (rMSSD), Body Temperature Deviation (°C), Blood Oxygen (SpO2 %), Daytime Stress vs. Recovery minutes, and Respiratory Rate.

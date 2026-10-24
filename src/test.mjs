@@ -205,7 +205,39 @@ async function runTests() {
     const importData = await importRes.json();
     assert.equal(importData.daysImported, 1);
 
-    console.log('✅ All 13 end-to-end open_oura BLE protocol, AES-128-ECB auth, binary event decoding, ecore scoring, couple-sync, analytics, and security tests passed!');
+    // 14. Test Oura Cycle Insights & Biphasic Temperature Ovulation Detection for Maya (userId = 2)
+    const cycleRes = await fetch(`${baseUrl}/api/dashboard/cycle?userId=2&days=60`, {
+      headers: { Cookie: cookie }
+    });
+    assert.equal(cycleRes.status, 200);
+    const cycleData = await cycleRes.json();
+    assert.equal(cycleData.hasCycleData, true);
+    assert.ok(cycleData.currentCycle?.cycleDay >= 1);
+    assert.equal(cycleData.currentCycle?.avgCycleLength, 28);
+    assert.ok(cycleData.currentCycle?.fertileWindow?.thermalShiftDeltaC >= 0.18);
+    assert.ok(cycleData.phaseComparison?.follicular?.tempDeviation < 0);
+    assert.ok(cycleData.phaseComparison?.luteal?.tempDeviation > 0);
+    assert.equal(cycleData.timeline.length, 60);
+
+    // Log daily symptom & flow on `/api/cycle/log`
+    const logCycleRes = await fetch(`${baseUrl}/api/cycle/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({
+        userId: 2,
+        day: cycleData.day,
+        flow: 'spotting',
+        symptoms: ['Cramps', 'Calm'],
+        ovulationTest: 'none',
+        notes: 'Tested cycle symptom logging'
+      })
+    });
+    assert.equal(logCycleRes.status, 200);
+    const logCycleJson = await logCycleRes.json();
+    assert.equal(logCycleJson.cycle.selectedDayLog.flow, 'spotting');
+    assert.deepEqual(logCycleJson.cycle.selectedDayLog.symptoms, ['Cramps', 'Calm']);
+
+    console.log('✅ All 14 end-to-end open_oura BLE protocol, AES-128-ECB auth, binary event decoding, ecore scoring, Cycle Insights (biphasic temp shift), couple-sync, analytics, and security tests passed!');
   } finally {
     server.close();
     if (fs.existsSync(TEST_DATA_DIR)) {

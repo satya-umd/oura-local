@@ -1,4 +1,4 @@
-import { handleStaticApi } from './static-backend.js?v=7';
+import { handleStaticApi } from './static-backend.js?v=8';
 
 const IS_GITHUB_PAGES = typeof window !== 'undefined' && window.location.hostname.endsWith('github.io');
 
@@ -17,6 +17,8 @@ const state = {
   corrDays: 60,
   corrX: 'bedtime_hour',
   corrY: 'deep_sleep_minutes',
+  cycleData: null,
+  cycleDays: 60,
   ringOverview: null,
   bleStatus: '',
   showResetGuide: false,
@@ -28,6 +30,18 @@ const state = {
 };
 
 const PRESET_TAGS = ['Magnesium', 'Sauna', 'Morning sunlight', 'Workout', 'Late meal', 'Wine', 'Travel', 'Breathwork'];
+const CYCLE_SYMPTOMS = [
+  'Cramps',
+  'Fatigue',
+  'Bloating',
+  'Breast Tenderness',
+  'Lower Back Ache',
+  'Headache',
+  'High Energy',
+  'Cravings',
+  'Calm',
+  'Insomnia'
+];
 
 function showToast(msg) {
   state.toast = msg;
@@ -149,7 +163,7 @@ function shiftDay(dayStr, deltaDays) {
 async function initApp() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker
-      .register('./sw.js?v=7')
+      .register('./sw.js?v=8')
       .then((reg) => reg.update().catch(() => {}))
       .catch(() => {});
   }
@@ -197,6 +211,16 @@ async function loadCurrentTabData() {
       if (!state.selectedDay && state.coupleData.day) {
         state.selectedDay = state.coupleData.day;
       }
+    } else if (state.activeTab === 'cycle') {
+      const q = new URLSearchParams({
+        userId: state.selectedUserId,
+        days: state.cycleDays
+      });
+      if (state.selectedDay) q.set('day', state.selectedDay);
+      state.cycleData = await api(`/api/dashboard/cycle?${q.toString()}`);
+      if (!state.selectedDay && state.cycleData.day) {
+        state.selectedDay = state.cycleData.day;
+      }
     } else if (state.activeTab === 'trends') {
       const q = new URLSearchParams({
         userId: state.selectedUserId,
@@ -232,6 +256,15 @@ async function loadCurrentTabData() {
 function setTab(tab) {
   state.activeTab = tab;
   window.location.hash = tab;
+  if (tab === 'cycle' && state.session?.householdMembers?.length > 1) {
+    const curMember = state.session.householdMembers.find((m) => Number(m.id) === Number(state.selectedUserId));
+    const wifeMember = state.session.householdMembers.find(
+      (m) => m.username === 'maya' || /wife|maya/i.test(m.displayName || '')
+    );
+    if (wifeMember && curMember && curMember.username === 'alex') {
+      state.selectedUserId = wifeMember.id;
+    }
+  }
   loadCurrentTabData();
 }
 
@@ -1024,9 +1057,42 @@ function renderCoupleView() {
                     <span class="avatar-dot" style="background:${escapeHtml(m.user.avatarColor)}"></span>
                     ${escapeHtml(m.user.displayName)}
                   </div>
-                  <div class="card-subtitle">${escapeHtml(m.user.ringName)} • ${escapeHtml(m.recoveryStatus)}</div>
+                  <div class="card-subtitle">${escapeHtml(m.user.ringName)} • ${escapeHtml(m.recoveryStatus || 'Synced')}</div>
                 </div>
+                ${
+                  m.cycleStatus
+                    ? `
+                  <button
+                    type="button"
+                    class="tag-chip"
+                    data-open-member-cycle="${m.user.id}"
+                    style="background:rgba(244,63,94,0.14);border-color:${escapeHtml(m.cycleStatus.phase?.color || '#f43f5e')};color:#fda4af;cursor:pointer;"
+                    title="Open Cycle Insights"
+                  >
+                    🌸 Day ${m.cycleStatus.cycleDay} • ${escapeHtml(m.cycleStatus.phase?.shortLabel || 'Cycle')}
+                  </button>
+                `
+                    : ''
+                }
               </div>
+
+              ${
+                m.cycleStatus
+                  ? `
+                <div style="margin-bottom:12px;padding:9px 12px;border-radius:10px;background:rgba(244,63,94,0.08);border:1px solid rgba(244,63,94,0.22);font-size:0.78rem;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
+                  <span>
+                    <strong style="color:${escapeHtml(m.cycleStatus.phase?.color || '#f43f5e')}">● ${escapeHtml(m.cycleStatus.phase?.label || 'Cycle Phase')}:</strong>
+                    ${escapeHtml(m.cycleStatus.phase?.recoveryTip || '')}
+                  </span>
+                  ${
+                    m.cycleStatus.daysUntilNextPeriod != null
+                      ? `<span style="color:var(--text-muted);font-weight:600;">Next period: ${m.cycleStatus.daysUntilNextPeriod <= 0 ? 'Due now' : `in ${m.cycleStatus.daysUntilNextPeriod}d`}</span>`
+                      : ''
+                  }
+                </div>
+              `
+                  : ''
+              }
 
               <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;text-align:center;margin-bottom:14px;">
                 <div style="background:rgba(15,23,42,0.7);padding:12px 8px;border-radius:10px;">
@@ -1114,6 +1180,497 @@ function renderCoupleView() {
     }
 
     ${dualChartHtml}
+  `;
+}
+
+function renderCycleDialSvg(cur) {
+  const r = 74;
+  const cx = 95;
+  const cy = 95;
+  const circum = 2 * Math.PI * r;
+  const cycleLen = Math.max(21, Math.min(40, cur?.avgCycleLength || 28));
+  const periodLen = Math.max(2, Math.min(8, cur?.avgPeriodLength || 5));
+  const ovDay = cur?.fertileWindow?.ovulationCycleDay || Math.max(12, cycleLen - 14);
+  const cycleDay = Math.max(1, Math.min(cycleLen, cur?.cycleDay || 1));
+
+  const segArc = (startDay, endDay, color) => {
+    const fracStart = (startDay - 1) / cycleLen;
+    const fracLen = Math.max(0.02, (endDay - startDay + 1) / cycleLen - 0.012);
+    const dash = fracLen * circum;
+    const gap = circum - dash;
+    const rot = -90 + fracStart * 360;
+    return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="12" stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${gap.toFixed(1)}" transform="rotate(${rot.toFixed(1)} ${cx} ${cy})" opacity="0.88" />`;
+  };
+
+  // Current day marker position on circle
+  const angleRad = ((-90 + ((cycleDay - 0.5) / cycleLen) * 360) * Math.PI) / 180;
+  const mx = cx + r * Math.cos(angleRad);
+  const my = cy + r * Math.sin(angleRad);
+  const phaseColor = cur?.phase?.color || '#f43f5e';
+
+  return `
+    <div class="cycle-dial-wrap">
+      <svg width="190" height="190" viewBox="0 0 190 190">
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="rgba(148,163,184,0.12)" stroke-width="12" />
+        ${segArc(1, periodLen, '#f43f5e')}
+        ${segArc(periodLen + 1, Math.max(periodLen + 1, ovDay - 3), '#38bdf8')}
+        ${segArc(Math.max(periodLen + 2, ovDay - 2), ovDay + 1, '#a855f7')}
+        ${segArc(ovDay + 2, cycleLen, '#f59e0b')}
+        <circle cx="${mx.toFixed(1)}" cy="${my.toFixed(1)}" r="9" fill="#0f172a" stroke="${phaseColor}" stroke-width="4" />
+        <circle cx="${mx.toFixed(1)}" cy="${my.toFixed(1)}" r="4" fill="#ffffff" />
+      </svg>
+      <div class="cycle-dial-center">
+        <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--text-muted);">Cycle Day</div>
+        <div style="font-size:2.2rem;font-weight:800;line-height:1.05;color:#f8fafc;">${cur ? cur.cycleDay : '--'}</div>
+        <div style="font-size:0.76rem;font-weight:700;color:${escapeHtml(phaseColor)};margin-top:2px;">
+          ${escapeHtml(cur?.phase?.shortLabel || 'No Cycle')}
+        </div>
+        <div style="font-size:0.68rem;color:var(--text-muted);">of ~${cycleLen}d</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderBiphasicTempChartSvg(timeline) {
+  if (!Array.isArray(timeline) || timeline.length === 0) {
+    return `<div style="color:var(--text-muted);padding:16px 0;">No temperature deviation history available yet.</div>`;
+  }
+  const w = 760;
+  const h = 235;
+  const padX = 42;
+  const padTop = 28;
+  const padBottom = 42;
+  const plotW = w - padX * 2;
+  const plotH = h - padTop - padBottom;
+  const zeroY = padTop + plotH / 2;
+  const maxAbs = 0.55; // ±0.55 °C full scale
+
+  const n = timeline.length;
+  const barStep = plotW / Math.max(1, n);
+  const barW = Math.max(3, Math.min(10, barStep * 0.66));
+
+  const valToY = (v) => {
+    const clamped = Math.max(-maxAbs, Math.min(maxAbs, v));
+    return zeroY - (clamped / maxAbs) * (plotH / 2);
+  };
+
+  const barsHtml = timeline
+    .map((item, idx) => {
+      const cx = padX + idx * barStep + barStep / 2;
+      const v = item.tempDeviation;
+      let barRect = '';
+      if (v !== null && v !== undefined && Number.isFinite(v)) {
+        const y = valToY(v);
+        const topY = Math.min(y, zeroY);
+        const barH = Math.max(2, Math.abs(zeroY - y));
+        // Positive (Luteal / Progesterone) = warm rose/amber; Negative (Follicular / Estrogen) = cool sky/indigo
+        const fill =
+          item.phase === 'menstrual'
+            ? '#f43f5e'
+            : v >= 0
+              ? '#f59e0b'
+              : '#38bdf8';
+        barRect = `<rect x="${(cx - barW / 2).toFixed(1)}" y="${topY.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" rx="2" fill="${fill}" opacity="0.85"><title>${item.day} (Day ${item.cycleDay || '-'}): ${v >= 0 ? '+' : ''}${v.toFixed(2)} °C</title></rect>`;
+      }
+
+      // Period bleeding marker at bottom
+      const hasFlow = item.flow && item.flow !== 'none';
+      const flowDot = hasFlow
+        ? `<circle cx="${cx.toFixed(1)}" cy="${h - 22}" r="${item.flow === 'heavy' ? 4.5 : 3.5}" fill="#f43f5e"><title>${item.day}: ${item.flow} flow</title></circle>`
+        : '';
+
+      // Ovulation marker
+      const ovMarker = item.isOvulationConfirmed
+        ? `
+          <line x1="${cx.toFixed(1)}" y1="${padTop - 6}" x2="${cx.toFixed(1)}" y2="${h - padBottom}" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="3 3" />
+          <circle cx="${cx.toFixed(1)}" cy="${padTop}" r="5" fill="#a855f7" stroke="#fff" stroke-width="1.5"><title>Ovulation Thermal Shift (${item.day})</title></circle>
+        `
+        : '';
+
+      return barRect + flowDot + ovMarker;
+    })
+    .join('');
+
+  // 3-day rolling average curve
+  const rollingPts = timeline
+    .map((item, idx) => {
+      if (item.rollingTemp3d === null || item.rollingTemp3d === undefined) return null;
+      const cx = padX + idx * barStep + barStep / 2;
+      const cy = valToY(item.rollingTemp3d);
+      return `${cx.toFixed(1)},${cy.toFixed(1)}`;
+    })
+    .filter(Boolean)
+    .join(' ');
+
+  return `
+    <div>
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;font-size:0.78rem;color:var(--text-muted);margin-bottom:8px;">
+        <span style="display:flex;gap:14px;flex-wrap:wrap;">
+          <span><strong style="color:#38bdf8">■ Follicular (&lt; 0.0°C cooler)</strong></span>
+          <span><strong style="color:#f59e0b">■ Luteal (&gt; 0.0°C progesterone shift)</strong></span>
+          <span><strong style="color:#f43f5e">● Menstrual Flow</strong></span>
+          <span><strong style="color:#a855f7">● Ovulation Shift</strong></span>
+          <span><strong style="color:#e2e8f0">— 3-Day Rolling Trend</strong></span>
+        </span>
+        <span>Oura Ring 3 NTC Sensor Resolution: <strong>±0.01 °C</strong></span>
+      </div>
+      <svg viewBox="0 0 ${w} ${h}" style="width:100%;height:235px;overflow:visible;">
+        <!-- +0.3°C and -0.3°C reference lines -->
+        <line x1="${padX}" y1="${valToY(0.3).toFixed(1)}" x2="${w - padX}" y2="${valToY(0.3).toFixed(1)}" stroke="rgba(148,163,184,0.12)" stroke-dasharray="3 3" />
+        <text x="6" y="${(valToY(0.3) + 4).toFixed(1)}" fill="#94a3b8" font-size="10">+0.3°C</text>
+
+        <!-- 0.0°C Personal Baseline -->
+        <line x1="${padX}" y1="${zeroY.toFixed(1)}" x2="${w - padX}" y2="${zeroY.toFixed(1)}" stroke="rgba(226,232,240,0.45)" stroke-width="1.4" />
+        <text x="6" y="${(zeroY + 4).toFixed(1)}" fill="#e2e8f0" font-size="10" font-weight="700">0.0°C</text>
+
+        <line x1="${padX}" y1="${valToY(-0.3).toFixed(1)}" x2="${w - padX}" y2="${valToY(-0.3).toFixed(1)}" stroke="rgba(148,163,184,0.12)" stroke-dasharray="3 3" />
+        <text x="6" y="${(valToY(-0.3) + 4).toFixed(1)}" fill="#94a3b8" font-size="10">-0.3°C</text>
+
+        ${barsHtml}
+        ${rollingPts ? `<polyline fill="none" stroke="#f8fafc" stroke-width="2.2" points="${rollingPts}" opacity="0.9" />` : ''}
+      </svg>
+      <div style="display:flex;justify-content:space-between;font-size:0.72rem;color:var(--text-muted);padding:0 36px;">
+        <span>${escapeHtml(timeline[0]?.day || '')}</span>
+        <span>${escapeHtml(timeline[Math.floor(timeline.length / 3)]?.day || '')}</span>
+        <span>${escapeHtml(timeline[Math.floor((timeline.length * 2) / 3)]?.day || '')}</span>
+        <span>${escapeHtml(timeline[timeline.length - 1]?.day || '')}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderCycleView() {
+  const cy = state.cycleData;
+  if (!cy) {
+    return `<div class="card"><p>Loading Oura Cycle Insights...</p></div>`;
+  }
+
+  const cur = cy.currentCycle;
+  const log = cy.selectedDayLog || { flow: 'none', symptoms: [], ovulationTest: 'none', notes: '' };
+  const pc = cy.phaseComparison || { follicular: {}, luteal: {} };
+  const members = state.session?.householdMembers || [];
+  const wifeMember = members.find((m) => m.username === 'maya' || /wife|maya/i.test(m.displayName || ''));
+
+  return `
+    ${
+      !cy.hasCycleData && wifeMember && Number(cy.user?.id) !== Number(wifeMember.id)
+        ? `
+      <div class="card" style="margin-bottom:16px;border:1px solid rgba(244,63,94,0.4);background:rgba(244,63,94,0.08);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+        <div>
+          <div style="font-weight:700;color:#fda4af;">Viewing ${escapeHtml(cy.user?.displayName)}'s profile (No menstrual cycle logs yet)</div>
+          <div style="font-size:0.82rem;color:var(--text-secondary);">Switch to <strong>${escapeHtml(wifeMember.displayName)}</strong> to view her active Cycle Insights, or log a period start date below.</div>
+        </div>
+        <button type="button" class="btn btn-primary" data-select-user="${wifeMember.id}">
+          🌸 Switch to ${escapeHtml(wifeMember.displayName)}
+        </button>
+      </div>
+    `
+        : ''
+    }
+
+    <!-- Hero Cycle Phase Card -->
+    <div class="card cycle-hero-card" style="margin-bottom:18px;border-top:3px solid ${escapeHtml(cur?.phase?.color || '#f43f5e')};">
+      <div class="cycle-hero-layout">
+        ${renderCycleDialSvg(cur)}
+
+        <div style="flex:1;min-width:260px;">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
+            <div>
+              <span class="tag-chip" style="background:rgba(244,63,94,0.16);border-color:${escapeHtml(cur?.phase?.color || '#f43f5e')};color:#fda4af;font-weight:700;">
+                🌸 ${escapeHtml(cur ? cur.phase.label : 'Cycle Tracking Ready')}
+              </span>
+              <h2 style="font-size:1.35rem;font-weight:800;margin:8px 0 4px;">
+                ${
+                  cur
+                    ? `${escapeHtml(cy.user?.displayName)} • Cycle Day ${cur.cycleDay} of ~${cur.avgCycleLength}`
+                    : `Start Menstrual Cycle Tracking for ${escapeHtml(cy.user?.displayName)}`
+                }
+              </h2>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="btn btn-primary" id="log-period-start-btn" style="background:linear-gradient(135deg,#f43f5e,#e11d48);">
+                🩸 Log Period Start (${escapeHtml(cy.day)})
+              </button>
+            </div>
+          </div>
+
+          <p style="font-size:0.88rem;color:var(--text-secondary);margin-bottom:10px;line-height:1.5;">
+            ${
+              cur
+                ? `<strong>Physiology:</strong> ${escapeHtml(cur.phase.hormoneSummary)}`
+                : `Log the first day of bleeding below or click "Log Period Start" to initialize Oura-style biphasic skin temperature ovulation & period predictions.`
+            }
+          </p>
+          ${
+            cur
+              ? `
+            <div style="padding:10px 14px;border-radius:10px;background:rgba(15,23,42,0.65);border:1px solid var(--border-subtle);font-size:0.83rem;color:#e2e8f0;">
+              💡 <strong>Training & Sleep Guidance:</strong> ${escapeHtml(cur.phase.recoveryTip)}
+            </div>
+          `
+              : ''
+          }
+        </div>
+      </div>
+    </div>
+
+    <!-- 3 Prediction & Biometric Cards -->
+    <div class="grid-3" style="margin-bottom:18px;">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🩸 Next Period Prediction</div>
+            <div class="card-subtitle">${escapeHtml(cur?.regularityLabel || '28-Day Baseline')} • ±${cur?.cycleVariabilityDays ?? 1}d variation</div>
+          </div>
+        </div>
+        <div style="font-size:1.75rem;font-weight:800;color:#fda4af;margin:6px 0;">
+          ${
+            cur?.daysUntilNextPeriod != null
+              ? cur.daysUntilNextPeriod <= 0
+                ? 'Due Now'
+                : `In ${cur.daysUntilNextPeriod} Days`
+              : '--'
+          }
+        </div>
+        <div style="font-size:0.82rem;color:var(--text-secondary);">
+          Estimated Start: <strong style="color:var(--text-primary)">${escapeHtml(cur?.predictedNextPeriodStart || 'Log period to predict')}</strong>
+        </div>
+        <div style="font-size:0.76rem;color:var(--text-muted);margin-top:6px;">
+          Avg Cycle: <strong>${cur?.avgCycleLength ?? 28} days</strong> • Avg Bleed: <strong>${cur?.avgPeriodLength ?? 5} days</strong>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">✨ Ovulation & Fertile Window</div>
+            <div class="card-subtitle">${escapeHtml(cur?.fertileWindow?.detectedBy || 'Biphasic Thermal Shift (3-over-6)')}</div>
+          </div>
+        </div>
+        <div style="font-size:1.25rem;font-weight:800;color:#c084fc;margin:6px 0;">
+          ${
+            cur?.fertileWindow?.start
+              ? `${escapeHtml(cur.fertileWindow.start)} → ${escapeHtml(cur.fertileWindow.end)}`
+              : '--'
+          }
+        </div>
+        <div style="font-size:0.82rem;color:var(--text-secondary);">
+          Ovulation: <strong style="color:var(--text-primary)">${
+            cur?.fertileWindow?.ovulationDay
+              ? `${escapeHtml(cur.fertileWindow.ovulationDay)} (Cycle Day ${cur.fertileWindow.ovulationCycleDay})`
+              : '--'
+          }</strong>
+        </div>
+        <div style="margin-top:8px;">
+          ${
+            cur?.fertileWindow?.thermalShiftDeltaC
+              ? `<span class="tag-chip" style="background:rgba(168,85,247,0.16);border-color:rgba(168,85,247,0.4);color:#d8b4fe;font-size:0.74rem;">✓ Confirmed by Ring Temp Shift (+${cur.fertileWindow.thermalShiftDeltaC}°C)</span>`
+              : `<span class="tag-chip inactive" style="font-size:0.74rem;">Awaiting post-ovulation +0.2°C thermal shift</span>`
+          }
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📊 Follicular vs. Luteal Biometrics</div>
+            <div class="card-subtitle">How hormone phases shift ${escapeHtml(cy.user?.displayName)}'s Oura metrics</div>
+          </div>
+        </div>
+        <table class="table-clean" style="font-size:0.8rem;">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th style="color:#38bdf8;">Follicular</th>
+              <th style="color:#f59e0b;">Luteal</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Skin Temp Δ</td>
+              <td><strong>${pc.follicular?.tempDeviation != null ? `${pc.follicular.tempDeviation > 0 ? '+' : ''}${pc.follicular.tempDeviation}°C` : '--'}</strong></td>
+              <td><strong>${pc.luteal?.tempDeviation != null ? `${pc.luteal.tempDeviation > 0 ? '+' : ''}${pc.luteal.tempDeviation}°C` : '--'}</strong></td>
+            </tr>
+            <tr>
+              <td>Resting HR</td>
+              <td><strong>${pc.follicular?.lowestHr ?? '--'} bpm</strong></td>
+              <td><strong>${pc.luteal?.lowestHr ?? '--'} bpm</strong></td>
+            </tr>
+            <tr>
+              <td>Night HRV</td>
+              <td><strong>${pc.follicular?.averageHrv ?? '--'} ms</strong></td>
+              <td><strong>${pc.luteal?.averageHrv ?? '--'} ms</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Oura Cycle Insights 60-Day Biphasic Skin Temperature Chart -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="card-header" style="flex-wrap:wrap;">
+        <div>
+          <div class="card-title">🌡️ Nightly Skin Temperature Deviation (Biphasic Cycle Curve)</div>
+          <div class="card-subtitle">
+            Decoded from Oura Ring Gen 3 <code>0x75 sleep_temp_event</code> packets • Follicular phase stays below 0.0°C; progesterone raises Luteal phase by +0.20°C to +0.45°C
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;">
+          ${[30, 60, 90]
+            .map(
+              (d) => `
+            <button type="button" class="btn ${state.cycleDays === d ? 'btn-primary' : ''}" data-cycle-days="${d}" style="padding:5px 10px;font-size:0.78rem;">
+              ${d} Days
+            </button>
+          `
+            )
+            .join('')}
+        </div>
+      </div>
+      ${renderBiphasicTempChartSvg(cy.timeline)}
+    </div>
+
+    <!-- Daily Period Flow, Ovulation Test & Symptom Logger + Recent Cycle History -->
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📝 Daily Cycle & Symptom Log (${escapeHtml(cy.day)})</div>
+            <div class="card-subtitle">Log bleeding flow, LH ovulation strips, or symptoms for ${escapeHtml(cy.day)}</div>
+          </div>
+        </div>
+
+        <div style="margin-bottom:14px;">
+          <div style="font-size:0.78rem;font-weight:700;color:var(--text-secondary);margin-bottom:6px;">Menstrual Bleeding Flow</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            ${[
+              { k: 'none', label: 'None' },
+              { k: 'spotting', label: '💧 Spotting' },
+              { k: 'light', label: '🩸 Light' },
+              { k: 'medium', label: '🩸🩸 Medium' },
+              { k: 'heavy', label: '🩸🩸🩸 Heavy' }
+            ]
+              .map(
+                (f) => `
+              <button
+                type="button"
+                class="tag-chip ${log.flow === f.k ? '' : 'inactive'}"
+                data-cycle-flow="${f.k}"
+                style="${log.flow === f.k ? 'background:rgba(244,63,94,0.22);border-color:#f43f5e;color:#fda4af;font-weight:700;' : ''}"
+              >
+                ${f.label}
+              </button>
+            `
+              )
+              .join('')}
+          </div>
+        </div>
+
+        <div style="margin-bottom:14px;">
+          <div style="font-size:0.78rem;font-weight:700;color:var(--text-secondary);margin-bottom:6px;">LH Ovulation Test Strip</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            ${[
+              { k: 'none', label: 'Not Tested' },
+              { k: 'negative', label: '➖ Negative' },
+              { k: 'positive', label: '✨ Positive (LH Surge)' }
+            ]
+              .map(
+                (ov) => `
+              <button
+                type="button"
+                class="tag-chip ${log.ovulationTest === ov.k ? '' : 'inactive'}"
+                data-cycle-ovulation="${ov.k}"
+                style="${log.ovulationTest === ov.k ? 'background:rgba(168,85,247,0.22);border-color:#a855f7;color:#d8b4fe;font-weight:700;' : ''}"
+              >
+                ${ov.label}
+              </button>
+            `
+              )
+              .join('')}
+          </div>
+        </div>
+
+        <div style="margin-bottom:14px;">
+          <div style="font-size:0.78rem;font-weight:700;color:var(--text-secondary);margin-bottom:6px;">Physical & Mood Symptoms</div>
+          <div style="display:flex;gap:7px;flex-wrap:wrap;">
+            ${CYCLE_SYMPTOMS.map((sym) => {
+              const active = (log.symptoms || []).includes(sym);
+              return `
+                <button
+                  type="button"
+                  class="tag-chip ${active ? '' : 'inactive'}"
+                  data-cycle-symptom="${escapeHtml(sym)}"
+                >
+                  ${active ? '✓' : '+'} ${escapeHtml(sym)}
+                </button>
+              `;
+            }).join('')}
+          </div>
+        </div>
+
+        <form id="cycle-note-form" style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input
+            class="form-input"
+            name="notes"
+            value="${escapeHtml(log.notes || '')}"
+            placeholder="Cycle notes for ${escapeHtml(cy.day)}..."
+            style="flex:1;min-width:200px;"
+          />
+          <button type="submit" class="btn btn-primary">Save Note</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📅 Recent Menstrual Cycles & Thermal Shifts</div>
+            <div class="card-subtitle">Historical cycle lengths, bleed durations, and 3-over-6 ovulation confirmations</div>
+          </div>
+        </div>
+        ${
+          (cy.cycleHistory || []).length > 0
+            ? `
+          <table class="table-clean">
+            <thead>
+              <tr>
+                <th>Cycle Start</th>
+                <th>Length</th>
+                <th>Period</th>
+                <th>Ovulation</th>
+                <th>Temp Shift</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${cy.cycleHistory
+                .map(
+                  (ch) => `
+                <tr>
+                  <td>
+                    <strong>${escapeHtml(ch.startDay)}</strong>
+                    ${ch.isCurrent ? `<span class="tag-chip" style="padding:2px 7px;font-size:0.68rem;margin-left:4px;">Current</span>` : ''}
+                  </td>
+                  <td>${ch.cycleLength}d ${ch.isCurrent ? '(so far)' : ''}</td>
+                  <td>${ch.periodLength}d flow</td>
+                  <td>Day ${ch.ovulationCycleDay} <small style="color:var(--text-muted);">(${escapeHtml(ch.ovulationDay)})</small></td>
+                  <td>
+                    ${
+                      ch.confirmedByTemp && ch.thermalShiftDeltaC
+                        ? `<span style="color:#10b981;font-weight:700;">+${ch.thermalShiftDeltaC}°C ✓</span>`
+                        : `<span style="color:var(--text-muted);">Est.</span>`
+                    }
+                  </td>
+                </tr>
+              `
+                )
+                .join('')}
+            </tbody>
+          </table>
+        `
+            : `<p style="color:var(--text-muted);font-size:0.84rem;padding:12px 0;">No periods logged for ${escapeHtml(cy.user?.displayName)} yet. Click "🩸 Log Period Start" above to begin tracking.</p>`
+        }
+      </div>
+    </div>
   `;
 }
 
@@ -1821,6 +2378,11 @@ function render() {
       icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`
     },
     {
+      id: 'cycle',
+      label: 'Cycle Insights',
+      icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>`
+    },
+    {
       id: 'trends',
       label: 'Trends & Tags',
       icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`
@@ -1900,6 +2462,7 @@ function render() {
 
         ${state.activeTab === 'today' ? renderTodayView() : ''}
         ${state.activeTab === 'couple' ? renderCoupleView() : ''}
+        ${state.activeTab === 'cycle' ? renderCycleView() : ''}
         ${state.activeTab === 'trends' ? renderTrendsView() : ''}
         ${state.activeTab === 'correlations' ? renderCorrelationsView() : ''}
         ${state.activeTab === 'settings' ? renderSettingsView() : ''}
@@ -2136,6 +2699,137 @@ function bindDashboardEvents() {
       render();
     });
   });
+
+  document.querySelectorAll('[data-open-member-cycle]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.selectedUserId = Number(btn.getAttribute('data-open-member-cycle'));
+      setTab('cycle');
+    });
+  });
+
+  // Cycle Insights controls
+  document.querySelectorAll('[data-cycle-days]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.cycleDays = Number(btn.getAttribute('data-cycle-days'));
+      loadCurrentTabData();
+    });
+  });
+
+  const logPeriodStartBtn = document.getElementById('log-period-start-btn');
+  if (logPeriodStartBtn) {
+    logPeriodStartBtn.addEventListener('click', async () => {
+      const day = state.cycleData?.day || state.selectedDay || localTodayStr();
+      try {
+        const res = await api('/api/cycle/log', {
+          method: 'POST',
+          body: JSON.stringify({
+            userId: state.selectedUserId,
+            day,
+            logPeriodStart: true
+          })
+        });
+        state.cycleData = res.cycle;
+        showToast(`Logged period start on ${day} and updated cycle predictions!`);
+        render();
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  }
+
+  document.querySelectorAll('[data-cycle-flow]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const flow = btn.getAttribute('data-cycle-flow');
+      const day = state.cycleData?.day || state.selectedDay || localTodayStr();
+      try {
+        const res = await api('/api/cycle/log', {
+          method: 'POST',
+          body: JSON.stringify({
+            userId: state.selectedUserId,
+            day,
+            flow
+          })
+        });
+        state.cycleData = res.cycle;
+        showToast(`Saved ${flow} flow for ${day}.`);
+        render();
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-cycle-ovulation]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const ovulationTest = btn.getAttribute('data-cycle-ovulation');
+      const day = state.cycleData?.day || state.selectedDay || localTodayStr();
+      try {
+        const res = await api('/api/cycle/log', {
+          method: 'POST',
+          body: JSON.stringify({
+            userId: state.selectedUserId,
+            day,
+            ovulationTest
+          })
+        });
+        state.cycleData = res.cycle;
+        showToast(`Saved ovulation test (${ovulationTest}) for ${day}.`);
+        render();
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-cycle-symptom]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const sym = btn.getAttribute('data-cycle-symptom');
+      const day = state.cycleData?.day || state.selectedDay || localTodayStr();
+      const curSyms = [...(state.cycleData?.selectedDayLog?.symptoms || [])];
+      const idx = curSyms.indexOf(sym);
+      if (idx > -1) curSyms.splice(idx, 1);
+      else curSyms.push(sym);
+
+      try {
+        const res = await api('/api/cycle/log', {
+          method: 'POST',
+          body: JSON.stringify({
+            userId: state.selectedUserId,
+            day,
+            symptoms: curSyms
+          })
+        });
+        state.cycleData = res.cycle;
+        render();
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
+
+  const cycleNoteForm = document.getElementById('cycle-note-form');
+  if (cycleNoteForm) {
+    cycleNoteForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(cycleNoteForm);
+      const day = state.cycleData?.day || state.selectedDay || localTodayStr();
+      try {
+        const res = await api('/api/cycle/log', {
+          method: 'POST',
+          body: JSON.stringify({
+            userId: state.selectedUserId,
+            day,
+            notes: fd.get('notes')
+          })
+        });
+        state.cycleData = res.cycle;
+        showToast('Saved cycle note!');
+        render();
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  }
 
   // Trends controls
   document.querySelectorAll('[data-trends-days]').forEach((btn) => {

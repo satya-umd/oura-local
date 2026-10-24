@@ -45,6 +45,7 @@ import {
   getHeartrateDay,
   getWorkoutsForDay,
   getUserBaselines,
+  upsertCycleLog,
   getSyncLogs,
   addSyncLog
 } from './db.mjs';
@@ -53,6 +54,7 @@ import {
   buildCoupleComparison,
   computeCorrelation,
   computeTagImpacts,
+  computeCycleInsights,
   exportUserData
 } from './analytics.mjs';
 
@@ -695,6 +697,55 @@ export const server = http.createServer(async (req, res) => {
       const day = url.searchParams.get('day') || latestDay;
       const comparison = buildCoupleComparison(day);
       return sendJson(res, 200, comparison);
+    }
+
+    // Menstrual Cycle & Oura Cycle Insights endpoint
+    if (pathname === '/api/dashboard/cycle' && method === 'GET') {
+      const targetUserId = Number(url.searchParams.get('userId') || currentUser.id);
+      if (!canAccessUser(currentUser, targetUserId)) {
+        return sendJson(res, 403, { error: 'Access denied.' });
+      }
+      const latestDay = getLatestDayForUser(targetUserId) || toLocalDayStr();
+      const day = url.searchParams.get('day') || latestDay;
+      const days = clampDays(Number(url.searchParams.get('days') || 60), 14, 180);
+      const result = computeCycleInsights(targetUserId, day, days);
+      return sendJson(res, 200, result);
+    }
+
+    // Log Menstrual Flow, Symptoms, or Ovulation LH Test
+    if (pathname === '/api/cycle/log' && method === 'POST') {
+      const body = await readJsonBody(req);
+      const targetUserId = Number(body.userId || currentUser.id);
+      if (!canAccessUser(currentUser, targetUserId)) {
+        return sendJson(res, 403, { error: 'Access denied.' });
+      }
+      const day = String(body.day || toLocalDayStr());
+
+      if (body.logPeriodStart) {
+        // Convenience 1-click "Log Period Start": logs 5 days of flow starting at `day` (up to today)
+        const todayStr = toLocalDayStr();
+        const flows = ['medium', 'heavy', 'medium', 'light', 'light'];
+        for (let i = 0; i < flows.length; i++) {
+          const dStr = subtractDaysStr(day, -i);
+          if (dStr <= todayStr || i === 0) {
+            upsertCycleLog(targetUserId, dStr, {
+              flow: flows[i],
+              symptoms: i === 0 ? ['Cramps'] : undefined,
+              notes: i === 0 ? 'Period started' : undefined
+            });
+          }
+        }
+      } else {
+        upsertCycleLog(targetUserId, day, {
+          flow: body.flow,
+          symptoms: body.symptoms,
+          ovulationTest: body.ovulationTest,
+          notes: body.notes
+        });
+      }
+
+      const result = computeCycleInsights(targetUserId, day, 60);
+      return sendJson(res, 200, { ok: true, cycle: result });
     }
 
     // Trends & Tag Impact endpoint

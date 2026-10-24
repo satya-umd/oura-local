@@ -1,8 +1,11 @@
 import {
   listHouseholdUsers,
+  getUserById,
   getDailySummary,
   getDailySummariesRange,
   getUserBaselines,
+  getCycleLogsForUser,
+  getCycleLog,
   toLocalDayStr
 } from './db.mjs';
 
@@ -10,6 +13,18 @@ function subtractDays(dayStr, numDays) {
   const [y, m, d] = String(dayStr).split('-').map(Number);
   const dt = new Date(y, (m || 1) - 1, (d || 1) - numDays, 12, 0, 0);
   return toLocalDayStr(dt);
+}
+
+function addDays(dayStr, numDays) {
+  return subtractDays(dayStr, -numDays);
+}
+
+function daysBetween(dayA, dayB) {
+  const [y1, m1, d1] = String(dayA).split('-').map(Number);
+  const [y2, m2, d2] = String(dayB).split('-').map(Number);
+  const t1 = new Date(y1, (m1 || 1) - 1, d1 || 1, 12, 0, 0).getTime();
+  const t2 = new Date(y2, (m2 || 1) - 1, d2 || 1, 12, 0, 0).getTime();
+  return Math.round((t2 - t1) / 86400000);
 }
 
 function parseBedtimeHour(isoStr) {
@@ -63,6 +78,7 @@ export function buildCoupleComparison(targetDay) {
       user,
       summary,
       baseline,
+      cycleStatus: buildMemberCycleBrief(user.id, targetDay),
       deltas: {
         rhrDelta,
         hrvDelta,
@@ -460,5 +476,404 @@ export function exportUserData(userId, format = 'json') {
     contentType: 'text/csv; charset=utf-8',
     filename: `laura-oura-export-user-${userId}.csv`,
     body: lines.join('\n')
+  };
+}
+
+// --- Oura Cycle Insights & Biphasic Skin Temperature Engine ---
+
+const PHASE_METADATA = {
+  menstrual: {
+    key: 'menstrual',
+    label: 'Menstrual Phase',
+    shortLabel: 'Menstrual',
+    color: '#f43f5e',
+    hormoneNote: 'Estrogen & progesterone are at baseline. Nightly skin temperature drops back below 0.0°C and RHR lowers.',
+    recoveryTip: 'Prioritize restorative sleep, iron-rich nutrition, gentle movement, and warmth.'
+  },
+  follicular: {
+    key: 'follicular',
+    label: 'Follicular Phase',
+    shortLabel: 'Follicular',
+    color: '#6366f1',
+    hormoneNote: 'Estrogen rises steadily prior to ovulation. Skin temperature stays cool (-0.10°C to -0.30°C below baseline) with strong HRV.',
+    recoveryTip: 'Prime window for high-intensity workouts, strength PRs, and higher training loads.'
+  },
+  ovulation: {
+    key: 'ovulation',
+    label: 'Ovulation & Fertile Window',
+    shortLabel: 'Ovulation Window',
+    color: '#06b6d4',
+    hormoneNote: 'Peak estrogen & LH surge followed by a biphasic thermal shift (+0.20°C to +0.45°C rise as progesterone releases).',
+    recoveryTip: 'Peak energy and social stamina. Stay well-hydrated as body temperature begins its upward shift.'
+  },
+  luteal: {
+    key: 'luteal',
+    label: 'Luteal Phase',
+    shortLabel: 'Luteal',
+    color: '#a855f7',
+    hormoneNote: 'Progesterone dominates, keeping nightly skin temperature elevated (+0.15°C to +0.45°C) and raising RHR by ~2–4 bpm.',
+    recoveryTip: 'Higher temperature and slightly lower HRV are normal hormonal shifts (not illness). Favor steady cardio, mobility, and earlier wind-down.'
+  },
+  untracked: {
+    key: 'untracked',
+    label: 'Log Period to Start Tracking',
+    shortLabel: 'Not Logged Yet',
+    color: '#64748b',
+    hormoneNote: 'Log your most recent period start date below to unlock biphasic ring temperature & cycle phase predictions.',
+    recoveryTip: 'Oura Ring 3 measures overnight skin temperature at ±0.01°C resolution to detect follicular and luteal phases.'
+  }
+};
+
+function buildMemberCycleBrief(userId, targetDay) {
+  const logs = getCycleLogsForUser(userId, '2000-01-01', targetDay);
+  const bleedingLogs = logs.filter((l) => ['light', 'medium', 'heavy'].includes(l.flow));
+  if (bleedingLogs.length === 0) return null;
+  const insights = computeCycleInsights(userId, targetDay, 30);
+  if (!insights.hasCycleData) return null;
+  return {
+    cycleDay: insights.currentCycleDay,
+    phase: insights.currentPhase,
+    daysUntilNextPeriod: insights.predictions.daysUntilNextPeriod,
+    tempDeviation: insights.todayLog?.tempDeviation ?? null
+  };
+}
+
+export function computeCycleInsights(userId, targetDay, days = 60) {
+  const startWindow = subtractDays(targetDay, Math.max(days, 120));
+  const summaries = getDailySummariesRange(userId, startWindow, targetDay);
+  const summaryByDay = new Map(summaries.map((s) => [s.day, s]));
+
+  const allLogs = getCycleLogsForUser(userId, '2000-01-01', addDays(targetDay, 30));
+  const logByDay = new Map(allLogs.map((l) => [l.day, l]));
+
+  // 1. Group bleeding days (light/medium/heavy) into distinct period episodes (gap > 3 days = new period)
+  const bleedingDays = allLogs
+    .filter((l) => ['light', 'medium', 'heavy'].includes(l.flow))
+    .map((l) => l.day)
+    .sort();
+
+  const periods = [];
+  for (const d of bleedingDays) {
+    const last = periods[periods.length - 1];
+    if (!last || daysBetween(last.endDay, d) > 3) {
+      periods.push({
+        startDay: d,
+        endDay: d,
+        days: [d]
+      });
+    } else {
+      last.endDay = d;
+      last.days.push(d);
+    }
+  }
+
+  // 2. Build cycle history & detect biphasic 3-over-6 thermal shift per cycle
+  const cycles = periods.map((p, idx) => {
+    const nextPeriod = periods[idx + 1] || null;
+    const rawLen = nextPeriod ? daysBetween(p.startDay, nextPeriod.startDay) : null;
+    const cycleLength = rawLen && rawLen >= 18 && rawLen <= 45 ? rawLen : null;
+    const periodLength = daysBetween(p.startDay, p.endDay) + 1;
+
+    // Scan days 8..24 of this cycle for a 3-over-6 temperature shift (+0.18°C above prior 6-day mean)
+    const searchMaxDay = Math.min(cycleLength ? cycleLength - 3 : 24, 25);
+    let detectedOvulationDay = null;
+    let detectedOvulationCycleDay = null;
+    let confirmedByTemp = false;
+
+    for (let cd = 10; cd <= searchMaxDay; cd++) {
+      const candDay = addDays(p.startDay, cd - 1);
+      const log = logByDay.get(candDay);
+      if (log?.ovulationTest === 'positive') {
+        detectedOvulationDay = candDay;
+        detectedOvulationCycleDay = cd;
+        confirmedByTemp = true;
+        break;
+      }
+
+      // Check 3 consecutive elevated nights starting at cd + 1 compared to 6 nights before cd + 1
+      const prev6 = [];
+      for (let k = cd - 5; k <= cd; k++) {
+        const s = summaryByDay.get(addDays(p.startDay, k - 1));
+        if (s?.readiness?.tempDeviation != null) prev6.push(s.readiness.tempDeviation);
+      }
+      const next3 = [];
+      for (let k = cd + 1; k <= cd + 3; k++) {
+        const s = summaryByDay.get(addDays(p.startDay, k - 1));
+        if (s?.readiness?.tempDeviation != null) next3.push(s.readiness.tempDeviation);
+      }
+      if (prev6.length >= 4 && next3.length === 3) {
+        const meanPrev6 = prev6.reduce((a, b) => a + b, 0) / prev6.length;
+        const all3Higher = next3.every((v) => v >= meanPrev6 + 0.15);
+        const meanNext3 = next3.reduce((a, b) => a + b, 0) / 3;
+        if (all3Higher && meanNext3 - meanPrev6 >= 0.2) {
+          detectedOvulationDay = candDay;
+          detectedOvulationCycleDay = cd;
+          confirmedByTemp = true;
+          break;
+        }
+      }
+    }
+
+    const estOvulationCycleDay = detectedOvulationCycleDay || Math.max(10, (cycleLength || 28) - 14);
+    const estOvulationDay = detectedOvulationDay || addDays(p.startDay, estOvulationCycleDay - 1);
+
+    // Compute follicular vs luteal temperature means for this cycle
+    const folTemps = [];
+    const lutTemps = [];
+    const spanDays = cycleLength || Math.min(32, Math.max(1, daysBetween(p.startDay, targetDay) + 1));
+    for (let cd = 1; cd <= spanDays; cd++) {
+      const s = summaryByDay.get(addDays(p.startDay, cd - 1));
+      const t = s?.readiness?.tempDeviation;
+      if (t != null) {
+        if (cd <= estOvulationCycleDay) folTemps.push(t);
+        else lutTemps.push(t);
+      }
+    }
+    const folMean = folTemps.length ? folTemps.reduce((a, b) => a + b, 0) / folTemps.length : null;
+    const lutMean = lutTemps.length ? lutTemps.reduce((a, b) => a + b, 0) / lutTemps.length : null;
+    const thermalShiftC =
+      folMean != null && lutMean != null ? Number((lutMean - folMean).toFixed(2)) : null;
+
+    return {
+      startDay: p.startDay,
+      endDay: nextPeriod ? subtractDays(nextPeriod.startDay, 1) : null,
+      periodEndDay: p.endDay,
+      periodLength,
+      cycleLength,
+      ovulationDay: estOvulationDay,
+      ovulationCycleDay: estOvulationCycleDay,
+      lutealLength: cycleLength ? cycleLength - estOvulationCycleDay : null,
+      confirmedByTemp,
+      follicularTempC: folMean != null ? Number(folMean.toFixed(2)) : null,
+      lutealTempC: lutMean != null ? Number(lutMean.toFixed(2)) : null,
+      thermalShiftC
+    };
+  });
+
+  const completedCycles = cycles.filter((c) => c.cycleLength != null);
+  const avgCycleLength = completedCycles.length
+    ? Math.round(completedCycles.reduce((a, c) => a + c.cycleLength, 0) / completedCycles.length)
+    : 28;
+  const avgPeriodLength = cycles.length
+    ? Math.round(cycles.reduce((a, c) => a + c.periodLength, 0) / cycles.length)
+    : 5;
+
+  let cycleVariationDays = 0;
+  if (completedCycles.length >= 2) {
+    const lens = completedCycles.map((c) => c.cycleLength);
+    cycleVariationDays = Number(((Math.max(...lens) - Math.min(...lens)) / 2).toFixed(1));
+  }
+
+  // Helper to resolve cycle day & phase for any calendar date
+  const resolveDayPhase = (dayStr) => {
+    const log = logByDay.get(dayStr);
+    const activeCycles = cycles.filter((c) => c.startDay <= dayStr);
+    const curCycle = activeCycles[activeCycles.length - 1] || null;
+    if (!curCycle) {
+      return {
+        cycleDay: null,
+        phase: 'untracked',
+        isOvulationDay: false,
+        isPeriodStart: false
+      };
+    }
+    const cd = daysBetween(curCycle.startDay, dayStr) + 1;
+    if (cd > 45) {
+      return {
+        cycleDay: cd,
+        phase: 'untracked',
+        isOvulationDay: false,
+        isPeriodStart: false
+      };
+    }
+    const ovCd = curCycle.ovulationCycleDay || Math.max(10, avgCycleLength - 14);
+    const isBleeding = log && ['light', 'medium', 'heavy'].includes(log.flow);
+    let phase = 'follicular';
+    if (isBleeding || cd <= curCycle.periodLength) {
+      phase = 'menstrual';
+    } else if (cd >= ovCd - 4 && cd <= ovCd + 1) {
+      phase = 'ovulation';
+    } else if (cd > ovCd + 1) {
+      phase = 'luteal';
+    }
+    return {
+      cycleDay: cd,
+      phase,
+      isOvulationDay: cd === ovCd,
+      isPeriodStart: dayStr === curCycle.startDay,
+      confirmedByTemp: curCycle.confirmedByTemp
+    };
+  };
+
+  // Current cycle state on targetDay
+  const targetState = resolveDayPhase(targetDay);
+  const currentPhaseMeta = PHASE_METADATA[targetState.phase] || PHASE_METADATA.untracked;
+  const activeCyclesUpToTarget = cycles.filter((c) => c.startDay <= targetDay);
+  const currentCycle = activeCyclesUpToTarget[activeCyclesUpToTarget.length - 1] || null;
+
+  const nextPeriodDate = currentCycle ? addDays(currentCycle.startDay, avgCycleLength) : null;
+  const daysUntilNextPeriod = nextPeriodDate ? daysBetween(targetDay, nextPeriodDate) : null;
+  const estOvulationCycleDay = currentCycle?.ovulationCycleDay || Math.max(10, avgCycleLength - 14);
+  const nextOvulationDate = currentCycle
+    ? addDays(currentCycle.startDay, estOvulationCycleDay - 1)
+    : null;
+  const fertileWindowStart = nextOvulationDate ? subtractDays(nextOvulationDate, 4) : null;
+  const fertileWindowEnd = nextOvulationDate ? addDays(nextOvulationDate, 1) : null;
+
+  // Build timeline for chart (days ending at targetDay)
+  const chartStartDay = subtractDays(targetDay, days - 1);
+  const timeline = [];
+  const folStats = { temps: [], rhrs: [], hrvs: [], sleeps: [] };
+  const lutStats = { temps: [], rhrs: [], hrvs: [], sleeps: [] };
+
+  for (let i = 0; i < days; i++) {
+    const d = addDays(chartStartDay, i);
+    const s = summaryByDay.get(d);
+    const l = logByDay.get(d);
+    const st = resolveDayPhase(d);
+    const tempDev = s?.readiness?.tempDeviation ?? null;
+    const rhr = s?.sleep?.lowestHr ?? null;
+    const hrv = s?.sleep?.averageHrv ?? null;
+    const sleepScore = s?.sleep?.score ?? null;
+
+    if (st.phase === 'menstrual' || st.phase === 'follicular' || st.phase === 'ovulation') {
+      if (tempDev != null) folStats.temps.push(tempDev);
+      if (rhr != null) folStats.rhrs.push(rhr);
+      if (hrv != null) folStats.hrvs.push(hrv);
+      if (sleepScore != null) folStats.sleeps.push(sleepScore);
+    } else if (st.phase === 'luteal') {
+      if (tempDev != null) lutStats.temps.push(tempDev);
+      if (rhr != null) lutStats.rhrs.push(rhr);
+      if (hrv != null) lutStats.hrvs.push(hrv);
+      if (sleepScore != null) lutStats.sleeps.push(sleepScore);
+    }
+
+    timeline.push({
+      day: d,
+      cycleDay: st.cycleDay,
+      phase: st.phase,
+      isOvulationDay: st.isOvulationDay,
+      isOvulationConfirmed: st.isOvulationDay && st.confirmedByTemp,
+      isPeriodStart: st.isPeriodStart,
+      tempDeviation: tempDev,
+      rhr,
+      hrv,
+      sleepScore,
+      readinessScore: s?.readiness?.score ?? null,
+      flow: l?.flow || 'none',
+      symptoms: l?.symptoms || [],
+      ovulationTest: l?.ovulationTest || 'none',
+      notes: l?.notes || ''
+    });
+  }
+
+  // Compute 3-day rolling temperature trend on timeline
+  for (let i = 0; i < timeline.length; i++) {
+    const win = [timeline[i - 2], timeline[i - 1], timeline[i]]
+      .filter((x) => x && x.tempDeviation != null)
+      .map((x) => x.tempDeviation);
+    const rollingVal = win.length
+      ? Number((win.reduce((a, b) => a + b, 0) / win.length).toFixed(2))
+      : null;
+    timeline[i].tempTrend = rollingVal;
+    timeline[i].rollingTemp3d = rollingVal;
+  }
+
+  const mean = (arr, dec = 1) =>
+    arr.length ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(dec)) : null;
+
+  const folTempAvg = mean(folStats.temps, 2);
+  const lutTempAvg = mean(lutStats.temps, 2);
+  const thermalShiftDelta =
+    folTempAvg != null && lutTempAvg != null ? Number((lutTempAvg - folTempAvg).toFixed(2)) : null;
+  const rawDayLog = getCycleLog(userId, targetDay);
+  const selectedDayLog = {
+    userId,
+    day: targetDay,
+    flow: rawDayLog?.flow || 'none',
+    symptoms: rawDayLog?.symptoms || [],
+    ovulationTest: rawDayLog?.ovulationTest || 'none',
+    notes: rawDayLog?.notes || ''
+  };
+  const todayItem = timeline[timeline.length - 1] || selectedDayLog;
+
+  const normalizedPhase = {
+    ...currentPhaseMeta,
+    hormoneSummary: currentPhaseMeta.hormoneSummary || currentPhaseMeta.hormoneNote || ''
+  };
+
+  const reversedHistory = [...cycles].reverse().slice(0, 6).map((c, idx) => ({
+    ...c,
+    cycleNumber: cycles.length - idx,
+    isCurrent: idx === 0,
+    cycleLength: c.cycleLength || daysBetween(c.startDay, targetDay) + 1,
+    thermalShiftDeltaC: c.thermalShiftC
+  }));
+
+  return {
+    user: getUserById(userId),
+    userId,
+    day: targetDay,
+    hasCycleData: cycles.length > 0,
+    currentCycleDay: targetState.cycleDay,
+    currentPhase: normalizedPhase,
+    confirmedByTemp: Boolean(currentCycle?.confirmedByTemp),
+    currentCycle: currentCycle
+      ? {
+          cycleStartDay: currentCycle.startDay,
+          cycleDay: targetState.cycleDay,
+          avgCycleLength,
+          avgPeriodLength,
+          cycleVariabilityDays: cycleVariationDays,
+          regularityLabel: cycleVariationDays <= 2.5 ? 'Regular' : 'Moderate Variation',
+          phase: normalizedPhase,
+          predictedNextPeriodStart: nextPeriodDate,
+          daysUntilNextPeriod,
+          fertileWindow: {
+            start: fertileWindowStart,
+            end: fertileWindowEnd,
+            ovulationDay: nextOvulationDate,
+            ovulationCycleDay: estOvulationCycleDay,
+            thermalShiftDeltaC: currentCycle.thermalShiftC ?? thermalShiftDelta,
+            detectedBy: currentCycle.confirmedByTemp
+              ? 'Oura Ring Biphasic Temp Shift (3-over-6)'
+              : 'Calendar & Luteal Baseline Estimate',
+            isInFertileWindow:
+              Boolean(fertileWindowStart && fertileWindowEnd && targetDay >= fertileWindowStart && targetDay <= fertileWindowEnd)
+          }
+        }
+      : null,
+    predictions: {
+      avgCycleLength,
+      avgPeriodLength,
+      cycleVariationDays,
+      regularityLabel: cycleVariationDays <= 2.5 ? 'Regular' : 'Variable',
+      nextPeriodDate,
+      daysUntilNextPeriod,
+      ovulationDate: nextOvulationDate,
+      ovulationCycleDay: estOvulationCycleDay,
+      fertileWindowStart,
+      fertileWindowEnd
+    },
+    phaseComparison: {
+      follicular: {
+        tempDeviation: folTempAvg,
+        lowestHr: mean(folStats.rhrs, 1),
+        averageHrv: mean(folStats.hrvs, 0),
+        sleepScore: mean(folStats.sleeps, 0)
+      },
+      luteal: {
+        tempDeviation: lutTempAvg,
+        lowestHr: mean(lutStats.rhrs, 1),
+        averageHrv: mean(lutStats.hrvs, 0),
+        sleepScore: mean(lutStats.sleeps, 0)
+      },
+      thermalShiftDelta
+    },
+    selectedDayLog,
+    todayLog: todayItem,
+    cycleHistory: reversedHistory,
+    cyclesHistory: reversedHistory,
+    timeline
   };
 }

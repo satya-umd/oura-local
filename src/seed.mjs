@@ -5,6 +5,8 @@ import {
   upsertDailySummary,
   replaceHeartrateDay,
   upsertWorkout,
+  upsertCycleLog,
+  getCycleLogsForUser,
   addSyncLog,
   setUserSyncState,
   getSetting,
@@ -24,6 +26,66 @@ function seededRandom(seed) {
 
 function clamp(val, min, max) {
   return Math.max(min, Math.min(max, val));
+}
+
+function getMayaCycleDayForOffset(offset) {
+  // Anchor cycle so today (offset = 0) is Cycle Day 19 (Luteal Phase, 5 days post-ovulation)
+  // Period starts occurred at offset = 18, 46, 74
+  const daysSinceAnchor = 74 - offset;
+  const mod = ((daysSinceAnchor % 28) + 28) % 28;
+  return mod + 1; // 1..28
+}
+
+export function seedMayaCycleLogs(userId, days = 90) {
+  const today = new Date();
+  for (let offset = days - 1; offset >= 0; offset--) {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - offset, 12, 0, 0);
+    const dayStr = toLocalDayStr(d);
+    const cycleDay = getMayaCycleDayForOffset(offset);
+    if (cycleDay === 1) {
+      upsertCycleLog(userId, dayStr, {
+        flow: 'medium',
+        symptoms: ['Cramps', 'Fatigue'],
+        ovulationTest: 'none',
+        notes: 'Cycle Day 1 — period started.'
+      });
+    } else if (cycleDay === 2) {
+      upsertCycleLog(userId, dayStr, {
+        flow: 'heavy',
+        symptoms: ['Cramps', 'Lower Back Ache'],
+        ovulationTest: 'none',
+        notes: 'Cycle Day 2 — heavier flow.'
+      });
+    } else if (cycleDay === 3) {
+      upsertCycleLog(userId, dayStr, {
+        flow: 'medium',
+        symptoms: ['Fatigue'],
+        ovulationTest: 'none',
+        notes: ''
+      });
+    } else if (cycleDay === 4 || cycleDay === 5) {
+      upsertCycleLog(userId, dayStr, {
+        flow: 'light',
+        symptoms: [],
+        ovulationTest: 'none',
+        notes: ''
+      });
+    } else if (cycleDay === 13) {
+      upsertCycleLog(userId, dayStr, {
+        flow: 'none',
+        symptoms: ['High Energy'],
+        ovulationTest: 'positive',
+        notes: 'Positive LH surge strip.'
+      });
+    } else if (cycleDay === 26) {
+      upsertCycleLog(userId, dayStr, {
+        flow: 'none',
+        symptoms: ['Bloating', 'Breast Tenderness'],
+        ovulationTest: 'none',
+        notes: 'Late luteal phase.'
+      });
+    }
+  }
 }
 
 function generateHypnogramAndCurves(totalBuckets, baseHr, baseHrv, rand) {
@@ -100,6 +162,14 @@ function generateIntradayHrSamples(dayStr, baseRhr, hasWorkout, rand) {
 export function seedDemoHousehold({ days = 90, force = false } = {}) {
   const existingUsers = listHouseholdUsers();
   if (existingUsers.length > 0 && !force) {
+    // Ensure Maya has demo cycle logs seeded if she is still in demo mode and has no cycle logs yet
+    const mayaExisting = existingUsers.find((u) => u.username === 'maya');
+    if (mayaExisting && !mayaExisting.hasLiveToken) {
+      const existingLogs = getCycleLogsForUser(mayaExisting.id);
+      if (existingLogs.length === 0) {
+        seedMayaCycleLogs(mayaExisting.id, days);
+      }
+    }
     return { seeded: false, users: existingUsers };
   }
 
@@ -239,13 +309,19 @@ export function seedDemoHousehold({ days = 90, force = false } = {}) {
       const remSleepSeconds = Math.round(clamp(totalSleepSeconds * (0.21 + (rand() - 0.5) * 0.05), 2700, 8400));
       const lightSleepSeconds = Math.max(3600, totalSleepSeconds - deepSleepSeconds - remSleepSeconds);
 
+      const isMaya = prof.id === user2.id;
+      const cycleDay = isMaya ? getMayaCycleDayForOffset(offset) : null;
+      const isLutealNight = isMaya && cycleDay >= 15;
+      const cycleRhrShift = isMaya ? (isLutealNight ? 2.4 : -1.1) : 0;
+      const cycleHrvShift = isMaya ? (isLutealNight ? -6 : 4) : 0;
+
       const sleepEfficiency = Math.round((totalSleepSeconds / timeInBedSeconds) * 100);
       const lowestHr = Math.round(
-        clamp(prof.baseRhr + bedtimePenalty * 1.6 + tagRhrEffect + (rand() - 0.5) * 3.2, 44, 68)
+        clamp(prof.baseRhr + cycleRhrShift + bedtimePenalty * 1.6 + tagRhrEffect + (rand() - 0.5) * 2.8, 44, 68)
       );
       const averageHr = Number((lowestHr + 5.2 + rand() * 2.4).toFixed(1));
       const averageHrv = Math.round(
-        clamp(prof.baseHrv - bedtimePenalty * 5.5 + tagHrvEffect + (rand() - 0.5) * 12, 32, 108)
+        clamp(prof.baseHrv + cycleHrvShift - bedtimePenalty * 5.5 + tagHrvEffect + (rand() - 0.5) * 10, 32, 108)
       );
       const averageBreath = Number((14.2 + (rand() - 0.5) * 1.4).toFixed(1));
 
@@ -291,9 +367,25 @@ export function seedDemoHousehold({ days = 90, force = false } = {}) {
         )
       );
 
-      const tempDeviation = Number(
-        clamp((lowestHr - prof.baseRhr) * 0.03 + (rand() - 0.5) * 0.22, -0.35, 0.48).toFixed(2)
-      );
+      let tempDeviation;
+      if (isMaya && cycleDay) {
+        // Biphasic Oura Ring 3 temperature profile:
+        // Follicular (Day 1..14): cooler (-0.12 to -0.28 °C), nadir around Day 13-14
+        // Luteal (Day 15..28): sustained progesterone thermal shift (+0.18 to +0.38 °C)
+        const basePhaseTemp =
+          cycleDay <= 12
+            ? -0.17
+            : cycleDay <= 14
+              ? -0.24
+              : cycleDay <= 26
+                ? 0.27
+                : 0.12;
+        tempDeviation = Number(clamp(basePhaseTemp + (rand() - 0.5) * 0.09, -0.38, 0.48).toFixed(2));
+      } else {
+        tempDeviation = Number(
+          clamp((lowestHr - prof.baseRhr) * 0.03 + (rand() - 0.5) * 0.22, -0.35, 0.48).toFixed(2)
+        );
+      }
 
       const hasWorkout = rand() < 0.48;
       const steps = Math.round(
@@ -391,6 +483,10 @@ export function seedDemoHousehold({ days = 90, force = false } = {}) {
         const samples = generateIntradayHrSamples(dayStr, lowestHr, hasWorkout, rand);
         replaceHeartrateDay(prof.id, dayStr, samples);
       }
+    }
+
+    if (prof.id === user2.id) {
+      seedMayaCycleLogs(user2.id, days);
     }
 
     const nowIso = new Date().toISOString();

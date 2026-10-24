@@ -679,6 +679,77 @@ function ingestBleNotificationsBrowser(db, user, { serial, notificationsHex = []
   };
 }
 
+function getMayaCycleDayForOffsetBrowser(offset) {
+  const daysSinceAnchor = 74 - offset;
+  const mod = ((daysSinceAnchor % 28) + 28) % 28;
+  return mod + 1;
+}
+
+function seedMayaCycleLogsBrowser(cycleLogsByUser, userId = 2) {
+  if (!cycleLogsByUser[userId]) cycleLogsByUser[userId] = {};
+  const now = new Date();
+  for (let i = 89; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i, 12, 0, 0);
+    const dayStr = toLocalDayStr(d);
+    const cDay = getMayaCycleDayForOffsetBrowser(i);
+    if (cDay === 1) {
+      cycleLogsByUser[userId][dayStr] = {
+        userId,
+        day: dayStr,
+        flow: 'medium',
+        symptoms: ['Cramps', 'Fatigue'],
+        ovulationTest: 'none',
+        notes: 'Cycle Day 1 — period started.'
+      };
+    } else if (cDay === 2) {
+      cycleLogsByUser[userId][dayStr] = {
+        userId,
+        day: dayStr,
+        flow: 'heavy',
+        symptoms: ['Cramps', 'Lower Back Ache'],
+        ovulationTest: 'none',
+        notes: 'Cycle Day 2 — heavier flow.'
+      };
+    } else if (cDay === 3) {
+      cycleLogsByUser[userId][dayStr] = {
+        userId,
+        day: dayStr,
+        flow: 'medium',
+        symptoms: ['Fatigue'],
+        ovulationTest: 'none',
+        notes: ''
+      };
+    } else if (cDay === 4 || cDay === 5) {
+      cycleLogsByUser[userId][dayStr] = {
+        userId,
+        day: dayStr,
+        flow: 'light',
+        symptoms: [],
+        ovulationTest: 'none',
+        notes: ''
+      };
+    } else if (cDay === 13) {
+      cycleLogsByUser[userId][dayStr] = {
+        userId,
+        day: dayStr,
+        flow: 'none',
+        symptoms: ['High Energy'],
+        ovulationTest: 'positive',
+        notes: 'Positive LH surge strip.'
+      };
+    } else if (cDay === 26) {
+      cycleLogsByUser[userId][dayStr] = {
+        userId,
+        day: dayStr,
+        flow: 'none',
+        symptoms: ['Bloating', 'Breast Tenderness'],
+        ovulationTest: 'none',
+        notes: 'Late luteal phase.'
+      };
+    }
+  }
+}
+
 // --- Seed Generator for Static Mode ---
 async function createInitialStaticDbAsync() {
   const alexHash = await hashPasswordBrowser('laura2026');
@@ -746,8 +817,13 @@ async function createInitialStaticDbAsync() {
       const wave = Math.sin((i + u.id * 4) * 0.35);
       const wave2 = Math.cos((i + u.id * 2) * 0.22);
 
-      const lowestHr = Math.round((isMaya ? 54 : 50) - wave * 3);
-      const averageHrv = Math.round((isMaya ? 68 : 62) + wave * 11 + wave2 * 4);
+      const cDay = isMaya ? getMayaCycleDayForOffsetBrowser(i) : null;
+      const isLuteal = isMaya && cDay >= 15;
+      const lowestHr = Math.round((isMaya ? (isLuteal ? 56 : 53) : 50) - wave * 2);
+      const averageHrv = Math.round((isMaya ? (isLuteal ? 64 : 71) : 62) + wave * 9 + wave2 * 4);
+      const biphasicTemp = isMaya
+        ? Number(((cDay <= 12 ? -0.17 : cDay <= 14 ? -0.24 : cDay <= 26 ? 0.27 : 0.12) + wave * 0.04).toFixed(2))
+        : Number((wave * 0.14).toFixed(2));
       const deepSeconds = Math.round((isMaya ? 6100 : 5600) + wave * 900);
       const remSeconds = Math.round((isMaya ? 6400 : 6000) + wave2 * 800);
       const lightSeconds = Math.round(14800 + wave * 1100);
@@ -782,8 +858,8 @@ async function createInitialStaticDbAsync() {
         isDemo: true,
         readiness: {
           score: readinessScore,
-          tempDeviation: Number((wave * 0.14).toFixed(2)),
-          tempTrendDeviation: Number((wave * 0.1).toFixed(2)),
+          tempDeviation: biphasicTemp,
+          tempTrendDeviation: Number((biphasicTemp * 0.75).toFixed(2)),
           contributors: {
             hrvBalance: Math.min(99, averageHrv + 20),
             restingHeartRate: Math.min(99, 138 - lowestHr),
@@ -857,6 +933,9 @@ async function createInitialStaticDbAsync() {
     }
   }
 
+  const cycleLogs = { 1: {}, 2: {} };
+  seedMayaCycleLogsBrowser(cycleLogs, 2);
+
   return {
     householdName: 'Alex & Maya Household',
     registrationLocked: true,
@@ -865,6 +944,7 @@ async function createInitialStaticDbAsync() {
     users,
     summaries,
     heartrates,
+    cycleLogs,
     ringEvents: {
       1: [
         { tagHex: '0x76', name: 'bedtime_period', count: 14 },
@@ -954,6 +1034,32 @@ async function loadDbAsync() {
           }
         }
       }
+      if (!parsed.cycleLogs || typeof parsed.cycleLogs !== 'object') {
+        parsed.cycleLogs = { 1: {}, 2: {} };
+        seedMayaCycleLogsBrowser(parsed.cycleLogs, 2);
+        // Also upgrade Maya's demo summaries to have realistic biphasic temperature deviations if she hasn't synced a real ring
+        const mayaUser = (parsed.users || []).find((u) => u.id === 2);
+        if (mayaUser && !mayaUser.hasSyncedRealRing && parsed.summaries?.[2]) {
+          const sortedDays = Object.keys(parsed.summaries[2]).sort();
+          sortedDays.forEach((dKey, idx) => {
+            const offset = sortedDays.length - 1 - idx;
+            const cDay = getMayaCycleDayForOffsetBrowser(offset);
+            const s = parsed.summaries[2][dKey];
+            if (s?.readiness) {
+              const bTemp = Number(((cDay <= 12 ? -0.17 : cDay <= 14 ? -0.24 : cDay <= 26 ? 0.27 : 0.12) + Math.sin(idx) * 0.04).toFixed(2));
+              s.readiness.tempDeviation = bTemp;
+              s.readiness.tempTrendDeviation = Number((bTemp * 0.75).toFixed(2));
+            }
+          });
+        }
+        mutated = true;
+      } else if (!parsed.cycleLogs[2] || Object.keys(parsed.cycleLogs[2]).length === 0) {
+        const mayaUser = (parsed.users || []).find((u) => u.id === 2);
+        if (mayaUser && !mayaUser.hasSyncedRealRing) {
+          seedMayaCycleLogsBrowser(parsed.cycleLogs, 2);
+          mutated = true;
+        }
+      }
       if (!Array.isArray(parsed.sessions)) parsed.sessions = [];
       if (mutated) saveDb(parsed);
       return parsed;
@@ -1012,6 +1118,362 @@ function computeBaselines(db, userId, upToDay, windowDays = 30) {
   };
 }
 
+const CYCLE_PHASE_META_BROWSER = {
+  menstrual: {
+    key: 'menstrual',
+    label: 'Menstrual Phase',
+    shortLabel: 'Menstrual',
+    color: '#f43f5e',
+    hormoneSummary: 'Estrogen & progesterone are at baseline; skin temperature drops back below baseline.',
+    recoveryTip: 'Prioritize restorative sleep, iron-rich nutrition, gentle walks, or mobility work.'
+  },
+  follicular: {
+    key: 'follicular',
+    label: 'Follicular Phase',
+    shortLabel: 'Follicular',
+    color: '#38bdf8',
+    hormoneSummary: 'Estrogen rises steadily; nightly skin temperature stays cooler (-0.1°C to -0.3°C) with lower RHR & higher HRV.',
+    recoveryTip: 'Prime window for high-intensity training, strength PRs, and deep cognitive focus.'
+  },
+  ovulation: {
+    key: 'ovulation',
+    label: 'Ovulation Window',
+    shortLabel: 'Ovulation',
+    color: '#a855f7',
+    hormoneSummary: 'Peak estrogen & LH surge trigger ovulation, followed by the biphasic thermal shift (+0.2°C to +0.4°C).',
+    recoveryTip: 'Peak fertile window & high energy — stay well hydrated and support recovery after intense sessions.'
+  },
+  luteal: {
+    key: 'luteal',
+    label: 'Luteal Phase',
+    shortLabel: 'Luteal',
+    color: '#f59e0b',
+    hormoneSummary: 'Progesterone dominates; Oura nightly skin temperature stays elevated (+0.15°C to +0.45°C) and RHR rises slightly.',
+    recoveryTip: 'Metabolic rate is higher — allow extra wind-down time, magnesium, and steady aerobic movement.'
+  }
+};
+
+function dayDiffBrowser(dayA, dayB) {
+  const a = localDayDate(dayA, 12, 0, 0);
+  const b = localDayDate(dayB, 12, 0, 0);
+  return Math.round((b.getTime() - a.getTime()) / 86400000);
+}
+
+function addDaysBrowser(dayStr, deltaDays) {
+  const dt = localDayDate(dayStr, 12, 0, 0);
+  dt.setDate(dt.getDate() + deltaDays);
+  return toLocalDayStr(dt);
+}
+
+function detectThermalShiftOvulationBrowser(summariesByDay, cycleStartDay, nextCycleStartDay) {
+  const maxDayOffset = nextCycleStartDay ? Math.min(28, dayDiffBrowser(cycleStartDay, nextCycleStartDay) - 3) : 24;
+  for (let cDay = 10; cDay <= maxDayOffset; cDay++) {
+    const candidateDay = addDaysBrowser(cycleStartDay, cDay - 1);
+    const prevTemps = [];
+    for (let k = 1; k <= 6; k++) {
+      const pDay = addDaysBrowser(candidateDay, -k);
+      const t = summariesByDay.get(pDay)?.readiness?.tempDeviation;
+      if (t !== null && t !== undefined && Number.isFinite(t)) prevTemps.push(t);
+    }
+    if (prevTemps.length < 3) continue;
+    const preMean = prevTemps.reduce((a, b) => a + b, 0) / prevTemps.length;
+
+    const postTemps = [];
+    for (let k = 1; k <= 3; k++) {
+      const fDay = addDaysBrowser(candidateDay, k);
+      const t = summariesByDay.get(fDay)?.readiness?.tempDeviation;
+      if (t !== null && t !== undefined && Number.isFinite(t)) postTemps.push(t);
+    }
+    if (postTemps.length < 2) continue;
+    const postMean = postTemps.reduce((a, b) => a + b, 0) / postTemps.length;
+    const allElevated = postTemps.every((t) => t >= preMean + 0.12);
+
+    if (postMean - preMean >= 0.18 && allElevated) {
+      return {
+        ovulationDay: candidateDay,
+        ovulationCycleDay: cDay,
+        thermalShiftDeltaC: Number((postMean - preMean).toFixed(2)),
+        detectedBy: 'Oura Ring Biphasic Temp Shift (3-over-6)'
+      };
+    }
+  }
+  return null;
+}
+
+function buildStaticCycleInsights(db, userId, targetDay, days = 60) {
+  const user = db.users.find((u) => u.id === Number(userId)) || db.users[0];
+  const userDaysMap = db.summaries[user.id] || {};
+  const allDayKeys = Object.keys(userDaysMap).sort();
+  const refDay = targetDay || allDayKeys[allDayKeys.length - 1] || toLocalDayStr();
+  const startWindowDay = addDaysBrowser(refDay, -(days - 1));
+  const lookbackStartDay = addDaysBrowser(refDay, -180);
+
+  const summaries = allDayKeys
+    .filter((d) => d >= lookbackStartDay && d <= refDay)
+    .map((d) => userDaysMap[d]);
+  const summariesByDay = new Map(summaries.map((s) => [s.day, s]));
+
+  const userLogsObj = db.cycleLogs?.[user.id] || {};
+  const allLogs = Object.values(userLogsObj)
+    .filter((l) => l.day >= lookbackStartDay && l.day <= addDaysBrowser(refDay, 14))
+    .sort((a, b) => a.day.localeCompare(b.day));
+  const logsByDay = new Map(allLogs.map((l) => [l.day, l]));
+
+  const flowDays = allLogs
+    .filter((l) => l.flow && l.flow !== 'none' && l.flow !== 'spotting')
+    .map((l) => l.day)
+    .sort();
+
+  const periodStarts = [];
+  const periodEndByStart = new Map();
+  let lastFlowDay = null;
+  let currentStart = null;
+
+  for (const d of flowDays) {
+    if (!lastFlowDay || dayDiffBrowser(lastFlowDay, d) > 3) {
+      currentStart = d;
+      periodStarts.push(d);
+      periodEndByStart.set(currentStart, d);
+    } else {
+      periodEndByStart.set(currentStart, d);
+    }
+    lastFlowDay = d;
+  }
+
+  const cycleLengths = [];
+  for (let i = 1; i < periodStarts.length; i++) {
+    const len = dayDiffBrowser(periodStarts[i - 1], periodStarts[i]);
+    if (len >= 20 && len <= 45) cycleLengths.push(len);
+  }
+  const avgCycleLength = cycleLengths.length
+    ? Math.round(cycleLengths.reduce((a, b) => a + b, 0) / cycleLengths.length)
+    : 28;
+  const cycleVariabilityDays =
+    cycleLengths.length >= 2 ? Math.max(...cycleLengths) - Math.min(...cycleLengths) : 1;
+
+  const periodLengths = periodStarts.map((st) => {
+    const end = periodEndByStart.get(st) || st;
+    return Math.max(1, Math.min(10, dayDiffBrowser(st, end) + 1));
+  });
+  const avgPeriodLength = periodLengths.length
+    ? Math.max(3, Math.round(periodLengths.reduce((a, b) => a + b, 0) / periodLengths.length))
+    : 5;
+
+  const startsUpToRef = periodStarts.filter((d) => d <= refDay);
+  const currentCycleStart = startsUpToRef.length ? startsUpToRef[startsUpToRef.length - 1] : null;
+  const cycleDay = currentCycleStart ? dayDiffBrowser(currentCycleStart, refDay) + 1 : null;
+
+  let ovulationInfo = null;
+  if (currentCycleStart) {
+    const lhPositive = allLogs.find(
+      (l) =>
+        l.day >= currentCycleStart &&
+        dayDiffBrowser(currentCycleStart, l.day) <= 24 &&
+        l.ovulationTest === 'positive'
+    );
+    const thermal = detectThermalShiftOvulationBrowser(summariesByDay, currentCycleStart, null);
+    if (thermal) {
+      ovulationInfo = thermal;
+    } else if (lhPositive) {
+      const ovDay = addDaysBrowser(lhPositive.day, 1);
+      ovulationInfo = {
+        ovulationDay: ovDay,
+        ovulationCycleDay: dayDiffBrowser(currentCycleStart, ovDay) + 1,
+        thermalShiftDeltaC: 0.25,
+        detectedBy: 'Positive LH Ovulation Test'
+      };
+    } else {
+      const estOvCycleDay = Math.max(11, avgCycleLength - 14);
+      const ovDay = addDaysBrowser(currentCycleStart, estOvCycleDay - 1);
+      ovulationInfo = {
+        ovulationDay: ovDay,
+        ovulationCycleDay: estOvCycleDay,
+        thermalShiftDeltaC: null,
+        detectedBy: 'Calendar & Luteal Baseline Estimate'
+      };
+    }
+  }
+
+  let currentPhaseKey = 'follicular';
+  if (currentCycleStart && cycleDay !== null) {
+    const currentLog = logsByDay.get(refDay);
+    const isBleedingToday = currentLog?.flow && currentLog.flow !== 'none' && currentLog.flow !== 'spotting';
+    const ovCycleDay = ovulationInfo?.ovulationCycleDay || Math.max(12, avgCycleLength - 14);
+    if (isBleedingToday || cycleDay <= avgPeriodLength) {
+      currentPhaseKey = 'menstrual';
+    } else if (cycleDay >= ovCycleDay - 2 && cycleDay <= ovCycleDay + 1) {
+      currentPhaseKey = 'ovulation';
+    } else if (cycleDay > ovCycleDay + 1) {
+      currentPhaseKey = 'luteal';
+    } else {
+      currentPhaseKey = 'follicular';
+    }
+  }
+
+  const phaseMeta = CYCLE_PHASE_META_BROWSER[currentPhaseKey];
+  const predictedNextPeriodStart = currentCycleStart
+    ? addDaysBrowser(currentCycleStart, avgCycleLength)
+    : null;
+  const daysUntilNextPeriod = predictedNextPeriodStart
+    ? dayDiffBrowser(refDay, predictedNextPeriodStart)
+    : null;
+
+  const fertileWindowStart = ovulationInfo ? addDaysBrowser(ovulationInfo.ovulationDay, -5) : null;
+  const fertileWindowEnd = ovulationInfo ? addDaysBrowser(ovulationInfo.ovulationDay, 1) : null;
+  const isInFertileWindow =
+    fertileWindowStart && fertileWindowEnd
+      ? refDay >= fertileWindowStart && refDay <= fertileWindowEnd
+      : false;
+
+  const follicularMetrics = { temp: [], rhr: [], hrv: [], sleepScore: [] };
+  const lutealMetrics = { temp: [], rhr: [], hrv: [], sleepScore: [] };
+
+  if (periodStarts.length > 0) {
+    for (const s of summaries) {
+      const startsBefore = periodStarts.filter((st) => st <= s.day);
+      if (!startsBefore.length) continue;
+      const st = startsBefore[startsBefore.length - 1];
+      const cDay = dayDiffBrowser(st, s.day) + 1;
+      if (cDay < 1 || cDay > 38) continue;
+      const bucket = cDay <= 14 ? follicularMetrics : lutealMetrics;
+      if (s.readiness?.tempDeviation != null) bucket.temp.push(s.readiness.tempDeviation);
+      if (s.sleep?.lowestHr != null) bucket.rhr.push(s.sleep.lowestHr);
+      if (s.sleep?.averageHrv != null) bucket.hrv.push(s.sleep.averageHrv);
+      if (s.sleep?.score != null) bucket.sleepScore.push(s.sleep.score);
+    }
+  }
+
+  const meanOrNull = (arr, decimals = 1) =>
+    arr.length ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(decimals)) : null;
+
+  const phaseComparison = {
+    follicular: {
+      tempDeviation: meanOrNull(follicularMetrics.temp, 2),
+      lowestHr: meanOrNull(follicularMetrics.rhr, 1),
+      averageHrv: meanOrNull(follicularMetrics.hrv, 0),
+      sleepScore: meanOrNull(follicularMetrics.sleepScore, 0)
+    },
+    luteal: {
+      tempDeviation: meanOrNull(lutealMetrics.temp, 2),
+      lowestHr: meanOrNull(lutealMetrics.rhr, 1),
+      averageHrv: meanOrNull(lutealMetrics.hrv, 0),
+      sleepScore: meanOrNull(lutealMetrics.sleepScore, 0)
+    }
+  };
+
+  const timeline = [];
+  for (let i = 0; i < days; i++) {
+    const d = addDaysBrowser(startWindowDay, i);
+    const s = summariesByDay.get(d);
+    const log = logsByDay.get(d);
+    const startsBefore = periodStarts.filter((st) => st <= d);
+    const st = startsBefore.length ? startsBefore[startsBefore.length - 1] : null;
+    const dCycleDay = st ? dayDiffBrowser(st, d) + 1 : null;
+
+    let dPhase = null;
+    if (st && dCycleDay !== null && dCycleDay <= 40) {
+      const hasFlow = log?.flow && log.flow !== 'none' && log.flow !== 'spotting';
+      const ovCDay = Math.max(12, avgCycleLength - 14);
+      if (hasFlow || dCycleDay <= avgPeriodLength) dPhase = 'menstrual';
+      else if (dCycleDay >= ovCDay - 2 && dCycleDay <= ovCDay + 1) dPhase = 'ovulation';
+      else if (dCycleDay > ovCDay + 1) dPhase = 'luteal';
+      else dPhase = 'follicular';
+    }
+
+    timeline.push({
+      day: d,
+      cycleDay: dCycleDay,
+      phase: dPhase,
+      tempDeviation: s?.readiness?.tempDeviation ?? null,
+      tempTrendDeviation: s?.readiness?.tempTrendDeviation ?? null,
+      lowestHr: s?.sleep?.lowestHr ?? null,
+      averageHrv: s?.sleep?.averageHrv ?? null,
+      readinessScore: s?.readiness?.score ?? null,
+      sleepScore: s?.sleep?.score ?? null,
+      flow: log?.flow || 'none',
+      symptoms: log?.symptoms || [],
+      ovulationTest: log?.ovulationTest || 'none',
+      notes: log?.notes || '',
+      isOvulationConfirmed: ovulationInfo?.ovulationDay === d
+    });
+  }
+
+  for (let i = 0; i < timeline.length; i++) {
+    const windowTemps = [];
+    for (let k = Math.max(0, i - 2); k <= i; k++) {
+      if (timeline[k].tempDeviation !== null && Number.isFinite(timeline[k].tempDeviation)) {
+        windowTemps.push(timeline[k].tempDeviation);
+      }
+    }
+    timeline[i].rollingTemp3d = windowTemps.length
+      ? Number((windowTemps.reduce((a, b) => a + b, 0) / windowTemps.length).toFixed(2))
+      : null;
+  }
+
+  const cycleHistory = [];
+  for (let i = 0; i < periodStarts.length; i++) {
+    const start = periodStarts[i];
+    const nextStart = periodStarts[i + 1] || null;
+    const end = periodEndByStart.get(start) || start;
+    const pLen = Math.max(1, dayDiffBrowser(start, end) + 1);
+    const cLen = nextStart ? dayDiffBrowser(start, nextStart) : dayDiffBrowser(start, refDay) + 1;
+    const ov = detectThermalShiftOvulationBrowser(summariesByDay, start, nextStart);
+    cycleHistory.push({
+      cycleNumber: i + 1,
+      startDay: start,
+      endDay: nextStart ? addDaysBrowser(nextStart, -1) : refDay,
+      isCurrent: !nextStart,
+      cycleLength: cLen,
+      periodLength: pLen,
+      ovulationDay: ov?.ovulationDay || addDaysBrowser(start, Math.max(11, avgCycleLength - 14) - 1),
+      ovulationCycleDay: ov?.ovulationCycleDay || Math.max(12, avgCycleLength - 14),
+      thermalShiftDeltaC: ov?.thermalShiftDeltaC || null,
+      confirmedByTemp: Boolean(ov)
+    });
+  }
+
+  const selectedDayLog = logsByDay.get(refDay) || {
+    userId: user.id,
+    day: refDay,
+    flow: 'none',
+    symptoms: [],
+    ovulationTest: 'none',
+    notes: ''
+  };
+
+  return {
+    user: sanitizeUser(user),
+    day: refDay,
+    hasCycleData: periodStarts.length > 0,
+    currentCycle: currentCycleStart
+      ? {
+          cycleStartDay: currentCycleStart,
+          cycleDay,
+          avgCycleLength,
+          avgPeriodLength,
+          cycleVariabilityDays,
+          regularityLabel: cycleVariabilityDays <= 3 ? 'Regular' : 'Moderate Variation',
+          phase: phaseMeta,
+          predictedNextPeriodStart,
+          daysUntilNextPeriod,
+          fertileWindow: {
+            start: fertileWindowStart,
+            end: fertileWindowEnd,
+            ovulationDay: ovulationInfo?.ovulationDay || null,
+            ovulationCycleDay: ovulationInfo?.ovulationCycleDay || null,
+            thermalShiftDeltaC: ovulationInfo?.thermalShiftDeltaC || null,
+            detectedBy: ovulationInfo?.detectedBy || null,
+            isInFertileWindow
+          }
+        }
+      : null,
+    selectedDayLog,
+    phaseComparison,
+    timeline,
+    cycleHistory: cycleHistory.reverse()
+  };
+}
+
 function buildStaticCoupleComparison(db, day) {
   const members = db.users.filter((u) => u.shareWithHousehold).map((u) => {
     const summary = db.summaries[u.id]?.[day] || null;
@@ -1019,10 +1481,22 @@ function buildStaticCoupleComparison(db, day) {
     const allUserDays = Object.values(db.summaries[u.id] || {})
       .filter((s) => s.day <= day)
       .sort((a, b) => a.day.localeCompare(b.day));
+    const cycleRes = buildStaticCycleInsights(db, u.id, day, 30);
+    const cycleStatus =
+      cycleRes.hasCycleData && cycleRes.currentCycle
+        ? {
+            cycleDay: cycleRes.currentCycle.cycleDay,
+            phase: cycleRes.currentCycle.phase,
+            daysUntilNextPeriod: cycleRes.currentCycle.daysUntilNextPeriod,
+            predictedNextPeriodStart: cycleRes.currentCycle.predictedNextPeriodStart,
+            fertileWindow: cycleRes.currentCycle.fertileWindow
+          }
+        : null;
     return {
       user: sanitizeUser(u),
       summary,
       baseline,
+      cycleStatus,
       series14: allUserDays.slice(-14),
       series30: allUserDays.slice(-30),
       deltas: {
@@ -1560,6 +2034,57 @@ export async function handleStaticApi(pathStr, options = {}) {
     const latestDay = allKeys[allKeys.length - 1] || toLocalDayStr();
     const day = url.searchParams.get('day') || latestDay;
     return buildStaticCoupleComparison(db, day);
+  }
+
+  if (pathname === '/api/dashboard/cycle' && method === 'GET') {
+    const targetUserId = Number(url.searchParams.get('userId') || currentUser.id);
+    const allKeys = Object.keys(db.summaries[targetUserId] || {}).sort();
+    const latestDay = allKeys[allKeys.length - 1] || toLocalDayStr();
+    const day = url.searchParams.get('day') || latestDay;
+    const days = Number(url.searchParams.get('days') || 60);
+    return buildStaticCycleInsights(db, targetUserId, day, days);
+  }
+
+  if (pathname === '/api/cycle/log' && method === 'POST') {
+    const targetUserId = Number(body.userId || currentUser.id);
+    const day = String(body.day || toLocalDayStr());
+    if (!db.cycleLogs) db.cycleLogs = {};
+    if (!db.cycleLogs[targetUserId]) db.cycleLogs[targetUserId] = {};
+
+    if (body.logPeriodStart) {
+      const todayStr = toLocalDayStr();
+      const flows = ['medium', 'heavy', 'medium', 'light', 'light'];
+      for (let i = 0; i < flows.length; i++) {
+        const dStr = addDaysBrowser(day, i);
+        if (dStr <= todayStr || i === 0) {
+          const existing = db.cycleLogs[targetUserId][dStr] || {};
+          db.cycleLogs[targetUserId][dStr] = {
+            userId: targetUserId,
+            day: dStr,
+            flow: flows[i],
+            symptoms: i === 0 ? ['Cramps'] : existing.symptoms || [],
+            ovulationTest: existing.ovulationTest || 'none',
+            notes: i === 0 ? 'Period started' : existing.notes || ''
+          };
+        }
+      }
+    } else {
+      const existing = db.cycleLogs[targetUserId][day] || {};
+      db.cycleLogs[targetUserId][day] = {
+        userId: targetUserId,
+        day,
+        flow: body.flow !== undefined ? body.flow : existing.flow || 'none',
+        symptoms: Array.isArray(body.symptoms) ? body.symptoms : existing.symptoms || [],
+        ovulationTest: body.ovulationTest !== undefined ? body.ovulationTest : existing.ovulationTest || 'none',
+        notes: body.notes !== undefined ? String(body.notes) : existing.notes || ''
+      };
+    }
+
+    saveDb(db);
+    return {
+      ok: true,
+      cycle: buildStaticCycleInsights(db, targetUserId, day, 60)
+    };
   }
 
   if (pathname === '/api/dashboard/trends' && method === 'GET') {

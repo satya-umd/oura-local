@@ -196,6 +196,21 @@ db.exec(`
     captured_unix INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
+
+  CREATE TABLE IF NOT EXISTS cycle_logs (
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    flow TEXT NOT NULL DEFAULT 'none',
+    symptoms_json TEXT NOT NULL DEFAULT '[]',
+    ovulation_test TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, day),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_cycle_logs_user_day
+    ON cycle_logs(user_id, day);
 `);
 
 // Safe migrations for existing `users` table
@@ -1054,4 +1069,79 @@ export function getRingOverviewForUser(userId) {
     })),
     recentEvents
   };
+}
+
+// --- Menstrual Cycle Tracking Storage Helpers ---
+
+export function upsertCycleLog(userId, day, { flow = 'none', symptoms = [], ovulationTest = '', notes = '' } = {}) {
+  const existing = db.prepare('SELECT * FROM cycle_logs WHERE user_id = ? AND day = ?').get(userId, day);
+  let existingSymptoms = [];
+  if (existing?.symptoms_json) {
+    try {
+      existingSymptoms = JSON.parse(existing.symptoms_json);
+    } catch {}
+  }
+
+  const finalFlow = flow !== undefined ? String(flow).toLowerCase() : (existing?.flow || 'none');
+  const finalSymptoms = Array.isArray(symptoms) ? symptoms : existingSymptoms;
+  const finalOvulation = ovulationTest !== undefined ? String(ovulationTest) : (existing?.ovulation_test || '');
+  const finalNotes = notes !== undefined ? String(notes) : (existing?.notes || '');
+
+  if (finalFlow === 'none' && finalSymptoms.length === 0 && !finalOvulation && !finalNotes) {
+    db.prepare('DELETE FROM cycle_logs WHERE user_id = ? AND day = ?').run(userId, day);
+    return null;
+  }
+
+  db.prepare(`
+    INSERT INTO cycle_logs (user_id, day, flow, symptoms_json, ovulation_test, notes, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(user_id, day) DO UPDATE SET
+      flow = excluded.flow,
+      symptoms_json = excluded.symptoms_json,
+      ovulation_test = excluded.ovulation_test,
+      notes = excluded.notes,
+      updated_at = datetime('now')
+  `).run(userId, day, finalFlow, JSON.stringify(finalSymptoms), finalOvulation, finalNotes);
+
+  return getCycleLog(userId, day);
+}
+
+export function getCycleLog(userId, day) {
+  const row = db.prepare('SELECT * FROM cycle_logs WHERE user_id = ? AND day = ?').get(userId, day);
+  if (!row) return null;
+  let symptoms = [];
+  try {
+    symptoms = JSON.parse(row.symptoms_json || '[]');
+  } catch {}
+  return {
+    userId: row.user_id,
+    day: row.day,
+    flow: row.flow,
+    symptoms,
+    ovulationTest: row.ovulation_test || '',
+    notes: row.notes || ''
+  };
+}
+
+export function getCycleLogsForUser(userId, startDay = '2000-01-01', endDay = '2099-12-31') {
+  const rows = db.prepare(`
+    SELECT * FROM cycle_logs
+    WHERE user_id = ? AND day >= ? AND day <= ?
+    ORDER BY day ASC
+  `).all(userId, startDay, endDay);
+
+  return rows.map((row) => {
+    let symptoms = [];
+    try {
+      symptoms = JSON.parse(row.symptoms_json || '[]');
+    } catch {}
+    return {
+      userId: row.user_id,
+      day: row.day,
+      flow: row.flow,
+      symptoms,
+      ovulationTest: row.ovulation_test || '',
+      notes: row.notes || ''
+    };
+  });
 }
